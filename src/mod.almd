@@ -267,7 +267,7 @@ test "options builder" {
 }
 
 test "with_tools" {
-  let ts = [Tool { name: "f", description: "d", parameters: json.object([]) }]
+  let ts = [Tool { name: "f", description: "d", parameters: value.object([]) }]
   assert_eq(list.len((defaults() |> with_tools(ts)).tools), 1)
 }
 

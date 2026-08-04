@@ -85,15 +85,15 @@ import json
 let weather_tool = Tool {
   name: "get_weather",
   description: "Get current weather for a city",
-  parameters: json.object([
-    ("type", json.from_string("object")),
-    ("properties", json.object([
-      ("city", json.object([
-        ("type", json.from_string("string")),
-        ("description", json.from_string("City name")),
+  parameters: value.object([
+    ("type", value.str("object")),
+    ("properties", value.object([
+      ("city", value.object([
+        ("type", value.str("string")),
+        ("description", value.str("City name")),
       ])),
     ])),
-    ("required", json.array([json.from_string("city")])),
+    ("required", value.array([value.str("city")])),
   ]),
 }
 

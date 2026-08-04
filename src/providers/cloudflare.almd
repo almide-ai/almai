@@ -17,8 +17,8 @@ type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: 
 type Tool = { name: String, description: String, parameters: Value }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
-  json.array(list.map(msgs, (m) =>
-    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])))
+  value.array(list.map(msgs, (m) =>
+    value.object([("role", value.str(m.role)), ("content", value.str(m.content))])))
 
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
@@ -36,13 +36,13 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
         ok(email) => {
           let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
           let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
-          let body = json.stringify(json.object([("messages", messages_to_json(sys_msgs + msgs))]))
+          let body = json.stringify(value.object([("messages", messages_to_json(sys_msgs + msgs))]))
           match http.request("POST", url, body, ["X-Auth-Key": api_key, "X-Auth-Email": email, "Content-Type": "application/json"]) {
             err(e) => err("cloudflare: http: " + e)
             ok(raw) => match json.parse(raw) {
               err(e) => err("cloudflare: json: " + e)
               ok(parsed) => {
-                let content = json.get(parsed, "result") |> option.flat_map((r) => json.get_string(r, "response")) |> option.unwrap_or("")
+                let content = value.field(parsed, "result")? |> option.flat_map((r) => json.get_string(r, "response")) |> option.unwrap_or("")
                 ok(LLMResponse { content: string.trim(content), model: model,
                   usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                   finish_reason: "stop", tool_calls: [] })

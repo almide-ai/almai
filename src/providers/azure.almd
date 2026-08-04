@@ -17,18 +17,18 @@ type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
-  json.array(list.map(msgs, (m) =>
-    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])))
+  value.array(list.map(msgs, (m) =>
+    value.object([("role", value.str(m.role)), ("content", value.str(m.content))])))
 
 fn tools_to_json(ts: List[Tool]) -> Value =
-  json.array(list.map(ts, (t) =>
-    json.object([("type", json.from_string("function")), ("function", json.object([
-      ("name", json.from_string(t.name)), ("description", json.from_string(t.description)), ("parameters", t.parameters)]))])))
+  value.array(list.map(ts, (t) =>
+    value.object([("type", value.str("function")), ("function", value.object([
+      ("name", value.str(t.name)), ("description", value.str(t.description)), ("parameters", t.parameters)]))])))
 
 fn parse_tool_calls(msg: Value) -> List[ToolCall] =
   json.get_array(msg, "tool_calls") |> option.unwrap_or([])
     |> list.filter_map((tc) => {
-      let func = json.get(tc, "function") |> option.unwrap_or(json.null())
+      let func = value.field(tc, "function")? |> option.unwrap_or(value.null())
       let name = json.get_string(func, "name") |> option.unwrap_or("")
       if name != "" then some(ToolCall { id: json.get_string(tc, "id") |> option.unwrap_or(""),
         name: name, arguments: json.get_string(func, "arguments") |> option.unwrap_or("{}") }) else none
@@ -45,17 +45,17 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       ok(endpoint) => {
         let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
         let url = endpoint + "/openai/deployments/" + model + "/chat/completions?api-version=2024-06-01"
-        let fields = [("messages", messages_to_json(sys_msgs + msgs)), ("max_tokens", json.from_int(opts.max_tokens))]
+        let fields = [("messages", messages_to_json(sys_msgs + msgs)), ("max_tokens", value.int(opts.max_tokens))]
         let fields = if not list.is_empty(opts.tools) then fields + [("tools", tools_to_json(opts.tools))] else fields
-        let body = json.stringify(json.object(fields))
+        let body = json.stringify(value.object(fields))
         match http.request("POST", url, body, ["api-key": api_key, "Content-Type": "application/json"]) {
           err(e) => err("azure: http: " + e)
           ok(raw) => match json.parse(raw) {
             err(e) => err("azure: json: " + e)
             ok(parsed) => {
-              let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(json.null())
-              let msg = json.get(choice, "message") |> option.unwrap_or(json.null())
-              let u = json.get(parsed, "usage") |> option.unwrap_or(json.null())
+              let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
+              let msg = value.field(choice, "message")? |> option.unwrap_or(value.null())
+              let u = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
               ok(LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
                 model: model, usage: Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
                   completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),

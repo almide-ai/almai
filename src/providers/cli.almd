@@ -73,7 +73,7 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
     }
     ok(v) => {
       let result_text = json.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
-      let usage_obj = json.get(v, "usage") |> option.unwrap_or(json.null())
+      let usage_obj = value.field(v, "usage")? |> option.unwrap_or(value.null())
       let in_tok  = json.get_int(usage_obj, "input_tokens")  |> option.unwrap_or(0)
       let out_tok = json.get_int(usage_obj, "output_tokens") |> option.unwrap_or(0)
       let model = json.get_string(v, "session_id") |> option.unwrap_or("claude-cli")

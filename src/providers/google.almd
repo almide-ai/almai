@@ -26,12 +26,12 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
       let all_msgs = sys_msgs + msgs
       let parts = list.map(all_msgs, (m) =>
-        json.object([("role", json.from_string(if m.role == "assistant" then "model" else "user")),
-          ("parts", json.array([json.object([("text", json.from_string(m.content))])]))])
+        value.object([("role", value.str(if m.role == "assistant" then "model" else "user")),
+          ("parts", value.array([value.object([("text", value.str(m.content))])]))])
       )
       let url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + api_key
-      let body = json.stringify(json.object([("contents", json.array(parts)),
-        ("generationConfig", json.object([("maxOutputTokens", json.from_int(opts.max_tokens))]))]))
+      let body = json.stringify(value.object([("contents", value.array(parts)),
+        ("generationConfig", value.object([("maxOutputTokens", value.int(opts.max_tokens))]))]))
       match http.request("POST", url, body, ["Content-Type": "application/json"]) {
         err(e) => err("google: http: " + e)
         ok(raw) => match json.parse(raw) {
@@ -39,7 +39,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
           ok(parsed) => {
             let content = json.get_array(parsed, "candidates")
               |> option.flat_map((cands) => list.first(cands))
-              |> option.flat_map((c) => json.get(c, "content"))
+              |> option.flat_map((c) => value.field(c, "content")?)
               |> option.flat_map((ct) => json.get_array(ct, "parts"))
               |> option.flat_map((ps) => list.first(ps))
               |> option.flat_map((p) => json.get_string(p, "text"))

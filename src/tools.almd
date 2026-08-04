@@ -22,47 +22,47 @@ fn tool(name: String, description: String, parameters: Value) -> Tool =
   Tool { name: name, description: description, parameters: parameters }
 
 fn tool_simple(name: String, description: String) -> Tool =
-  Tool { name: name, description: description, parameters: json.object([]) }
+  Tool { name: name, description: description, parameters: value.object([]) }
 
 // ── JSON Schema helpers ──
 
 fn param_string(description: String) -> Value =
-  json.object([("type", json.from_string("string")), ("description", json.from_string(description))])
+  value.object([("type", value.str("string")), ("description", value.str(description))])
 
 fn param_int(description: String) -> Value =
-  json.object([("type", json.from_string("integer")), ("description", json.from_string(description))])
+  value.object([("type", value.str("integer")), ("description", value.str(description))])
 
 fn param_bool(description: String) -> Value =
-  json.object([("type", json.from_string("boolean")), ("description", json.from_string(description))])
+  value.object([("type", value.str("boolean")), ("description", value.str(description))])
 
 fn param_enum(description: String, values: List[String]) -> Value =
-  json.object([
-    ("type", json.from_string("string")),
-    ("description", json.from_string(description)),
-    ("enum", json.array(list.map(values, (v) => json.from_string(v)))),
+  value.object([
+    ("type", value.str("string")),
+    ("description", value.str(description)),
+    ("enum", value.array(list.map(values, (v) => value.str(v)))),
   ])
 
 fn params(props: List[(String, Value)], required: List[String]) -> Value =
-  json.object([
-    ("type", json.from_string("object")),
-    ("properties", json.object(list.map(props, (p) => (p.0, p.1)))),
-    ("required", json.array(list.map(required, (r) => json.from_string(r)))),
+  value.object([
+    ("type", value.str("object")),
+    ("properties", value.object(list.map(props, (p) => (p.0, p.1)))),
+    ("required", value.array(list.map(required, (r) => value.str(r)))),
   ])
 
 // ── Serialization ──
 
 fn tool_to_json(t: Tool) -> Value =
-  json.object([
-    ("type", json.from_string("function")),
-    ("function", json.object([
-      ("name", json.from_string(t.name)),
-      ("description", json.from_string(t.description)),
+  value.object([
+    ("type", value.str("function")),
+    ("function", value.object([
+      ("name", value.str(t.name)),
+      ("description", value.str(t.description)),
       ("parameters", t.parameters),
     ])),
   ])
 
 fn tools_to_json(ts: List[Tool]) -> Value =
-  json.array(list.map(ts, (t) => tool_to_json(t)))
+  value.array(list.map(ts, (t) => tool_to_json(t)))
 
 // ── Parsing ──
 
@@ -71,7 +71,7 @@ fn parse_tool_calls(v: Value) -> List[ToolCall] =
     |> option.unwrap_or([])
     |> list.filter_map((tc) => {
       let id = json.get_string(tc, "id") |> option.unwrap_or("")
-      let func = json.get(tc, "function") |> option.unwrap_or(json.null())
+      let func = value.field(tc, "function")? |> option.unwrap_or(value.null())
       let name = json.get_string(func, "name") |> option.unwrap_or("")
       let args = json.get_string(func, "arguments") |> option.unwrap_or("{}")
       if name != "" then some(ToolCall { id: id, name: name, arguments: args })
@@ -111,13 +111,13 @@ test "tool_to_json wraps in function type" {
 }
 
 test "parse_tool_calls extracts from JSON" {
-  let raw = json.object([
-    ("tool_calls", json.array([
-      json.object([
-        ("id", json.from_string("call_1")),
-        ("function", json.object([
-          ("name", json.from_string("greet")),
-          ("arguments", json.from_string("{\"name\":\"Alice\"}")),
+  let raw = value.object([
+    ("tool_calls", value.array([
+      value.object([
+        ("id", value.str("call_1")),
+        ("function", value.object([
+          ("name", value.str("greet")),
+          ("arguments", value.str("{\"name\":\"Alice\"}")),
         ])),
       ]),
     ])),

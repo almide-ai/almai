@@ -20,7 +20,7 @@ test "options builder" {
 }
 
 test "tool construction" {
-  let t = Tool { name: "get_weather", description: "Get weather", parameters: json.object([]) }
+  let t = Tool { name: "get_weather", description: "Get weather", parameters: value.object([]) }
   assert_eq(t.name, "get_weather")
 }
 
@@ -35,7 +35,7 @@ test "response helpers" {
 }
 
 test "with_tools" {
-  let ts = [Tool { name: "f", description: "d", parameters: json.object([]) }]
+  let ts = [Tool { name: "f", description: "d", parameters: value.object([]) }]
   let opts = almai.defaults() |> almai.with_tools(ts)
   assert_eq(list.len(opts.tools), 1)
 }

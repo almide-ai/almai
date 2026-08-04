@@ -19,49 +19,49 @@ type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: 
 // Emit a single tool_call as the OpenAI Chat Completions wire shape:
 //   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
 fn tool_call_to_json(tc: ToolCall) -> Value =
-  json.object([
-    ("id", json.from_string(tc.id)),
-    ("type", json.from_string("function")),
-    ("function", json.object([
-      ("name", json.from_string(tc.name)),
-      ("arguments", json.from_string(tc.arguments)),
+  value.object([
+    ("id", value.str(tc.id)),
+    ("type", value.str("function")),
+    ("function", value.object([
+      ("name", value.str(tc.name)),
+      ("arguments", value.str(tc.arguments)),
     ])),
   ])
 
 fn message_to_json(m: Message) -> Value = {
   // Base shape — every message has role + content
-  let base = [("role", json.from_string(m.role)), ("content", json.from_string(m.content))]
+  let base = [("role", value.str(m.role)), ("content", value.str(m.content))]
   // role:"assistant" with tool_calls → emit `tool_calls` array
   let with_tool_calls = if m.role == "assistant" and not list.is_empty(m.tool_calls) then
-    base + [("tool_calls", json.array(list.map(m.tool_calls, (tc) => tool_call_to_json(tc))))]
+    base + [("tool_calls", value.array(list.map(m.tool_calls, (tc) => tool_call_to_json(tc))))]
   else base
   // role:"tool" requires `tool_call_id` to correlate with the assistant call
   let with_id = if m.role == "tool" and m.tool_call_id != "" then
-    with_tool_calls + [("tool_call_id", json.from_string(m.tool_call_id))]
+    with_tool_calls + [("tool_call_id", value.str(m.tool_call_id))]
   else with_tool_calls
-  json.object(with_id)
+  value.object(with_id)
 }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
-  json.array(list.map(msgs, (m) => message_to_json(m)))
+  value.array(list.map(msgs, (m) => message_to_json(m)))
 
 fn tools_to_json(ts: List[Tool]) -> Value =
-  json.array(list.map(ts, (t) =>
-    json.object([("type", json.from_string("function")), ("function", json.object([
-      ("name", json.from_string(t.name)), ("description", json.from_string(t.description)), ("parameters", t.parameters)]))])))
+  value.array(list.map(ts, (t) =>
+    value.object([("type", value.str("function")), ("function", value.object([
+      ("name", value.str(t.name)), ("description", value.str(t.description)), ("parameters", t.parameters)]))])))
 
 fn parse_tool_calls(msg: Value) -> List[ToolCall] =
   json.get_array(msg, "tool_calls") |> option.unwrap_or([])
     |> list.filter_map((tc) => {
       let id = json.get_string(tc, "id") |> option.unwrap_or("")
-      let func = json.get(tc, "function") |> option.unwrap_or(json.null())
+      let func = value.field(tc, "function")? |> option.unwrap_or(value.null())
       let name = json.get_string(func, "name") |> option.unwrap_or("")
       let args = json.get_string(func, "arguments") |> option.unwrap_or("{}")
       if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
     })
 
 fn parse_usage(v: Value) -> Usage = {
-  let u = json.get(v, "usage") |> option.unwrap_or(json.null())
+  let u = value.field(v, "usage")? |> option.unwrap_or(value.null())
   Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
     completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
     total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) }
@@ -72,7 +72,7 @@ effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> R
     err(e) => err("http: " + e)
     ok(raw) => match json.parse(raw) {
       err(e) => err("json: " + e + " raw: " + string.take(raw, 200))
-      ok(parsed) => match json.get(parsed, "error") |> option.flat_map((e) => json.get_string(e, "message")) {
+      ok(parsed) => match value.field(parsed, "error")? |> option.flat_map((e) => json.get_string(e, "message")) {
         some(msg) => err("api: " + msg)
         none => ok(parsed)
       }
@@ -83,13 +83,13 @@ effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> R
 fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> Value = {
   let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
   let all_msgs = sys_msgs + msgs
-  let fields = [("model", json.from_string(model)), ("messages", messages_to_json(all_msgs)),
-    ("max_tokens", json.from_int(opts.max_tokens)), ("temperature", json.from_float(opts.temperature))]
+  let fields = [("model", value.str(model)), ("messages", messages_to_json(all_msgs)),
+    ("max_tokens", value.int(opts.max_tokens)), ("temperature", value.float(opts.temperature))]
   let fields = if not list.is_empty(opts.tools) then fields + [("tools", tools_to_json(opts.tools))] else fields
-  let fields = if opts.json_mode then fields + [("response_format", json.object([("type", json.from_string("json_object"))]))] else fields
-  let fields = if not list.is_empty(opts.stop) then fields + [("stop", json.array(list.map(opts.stop, (s) => json.from_string(s))))] else fields
-  let fields = if stream then fields + [("stream", json.from_bool(true))] else fields
-  json.object(fields)
+  let fields = if opts.json_mode then fields + [("response_format", value.object([("type", value.str("json_object"))]))] else fields
+  let fields = if not list.is_empty(opts.stop) then fields + [("stop", value.array(list.map(opts.stop, (s) => value.str(s))))] else fields
+  let fields = if stream then fields + [("stream", value.bool(true))] else fields
+  value.object(fields)
 }
 
 effect fn call(base_url: String, api_key: String, model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
@@ -97,8 +97,8 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
   match post_json(base_url + "/chat/completions", body, ["Authorization": "Bearer " + api_key, "Content-Type": "application/json"]) {
     err(e) => err(e)
     ok(parsed) => {
-      let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(json.null())
-      let msg = json.get(choice, "message") |> option.unwrap_or(json.null())
+      let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
+      let msg = value.field(choice, "message")? |> option.unwrap_or(value.null())
       ok(LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
         model: json.get_string(parsed, "model") |> option.unwrap_or(""), usage: parse_usage(parsed),
         finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg) })
@@ -136,7 +136,7 @@ effect fn call_streaming(
           let args = json.get_string(tc, "arguments") |> option.unwrap_or("{}")
           if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
         })
-        let usage_obj = json.get(parsed, "usage") |> option.unwrap_or(json.null())
+        let usage_obj = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
         ok(LLMResponse {
           content: json.get_string(parsed, "content") |> option.unwrap_or(""),
           model: json.get_string(parsed, "model") |> option.unwrap_or(""),
@@ -158,4 +158,4 @@ test "messages_to_json" {
   assert(string.contains(j, "user"))
 }
 
-test "parse_tool_calls empty" { assert_eq(list.len(parse_tool_calls(json.object([]))), 0) }
+test "parse_tool_calls empty" { assert_eq(list.len(parse_tool_calls(value.object([]))), 0) }
