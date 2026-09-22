@@ -20,8 +20,9 @@
 // This is not a copy of openai.build_body: `/ai/run/{model}` puts the model
 // in the URL, not the body, and the sampling set differs. The duplication
 // worth removing is real but larger than this fix — moving `cf/` onto the
-// compat endpoint would also buy real token usage (this path reports zeros)
-// and tool calls, and it needs its own measured before/after.
+// compat endpoint would also buy tool calls, and token usage on the older
+// `result.response` shape, which reports none — this path now reads usage
+// wherever the response carries it. It needs its own measured before/after.
 
 import env
 import http
@@ -173,6 +174,44 @@ fn completion_text(parsed: Value) -> Option[String] =
     },
   }
 
+// WHY THE GENERATION STOPPED, when Cloudflare says.
+//
+// This provider used to write `finish_reason: "stop"` unconditionally,
+// without reading the response at all. "stop" is precisely the answer a
+// caller checks to rule out the failure it is looking for: a completion cut
+// off by the token budget arrives looking exactly like a finished one, so a
+// harness asking "was this truncated?" was told "no" by a constant.
+//
+// The chat shape carries `finish_reason` on the choice; the older
+// `result.response` shape carries none. When it is absent the honest answer
+// is "" — not reported — never the good case. Defaulting an unknown to
+// "stop" is the same sentence the constant was.
+fn finish_reason_of(parsed: Value) -> String =
+  (match value.field(parsed, "result")? {
+    none => none,
+    some(r) =>
+      list.first(json.get_array(r, "choices") ?? [])
+        |> option.flat_map((c) => json.get_string(c, "finish_reason")),
+  }) ?? ""
+
+// WHAT THE CALL COST, when Cloudflare says.
+//
+// Same defect, same fix: this was three hardcoded zeros. A zero token count
+// is not "unknown" — it reads as a call that consumed nothing, which is a
+// number a cost or budget report will happily add up. Cloudflare reports
+// usage on the chat shape only, so an absent field stays 0 here and the
+// caller can tell the two apart by whether all three are 0 (the older shape
+// reports nothing at all).
+fn usage_of(parsed: Value) -> Usage =
+  match value.field(parsed, "result")? |> option.flat_map((r) => value.field(r, "usage")?) {
+    none => Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    some(u) => Usage {
+      prompt_tokens: json.get_int(u, "prompt_tokens") ?? 0,
+      completion_tokens: json.get_int(u, "completion_tokens") ?? 0,
+      total_tokens: json.get_int(u, "total_tokens") ?? 0,
+    },
+  }
+
 // WHAT CLOUDFLARE SAID, not just that it said nothing.
 //
 // The REST surface answers a bad credential, an exhausted quota, a model the
@@ -216,8 +255,8 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
               ok(parsed) => match completion_text(parsed) {
                 none => err("cloudflare: no completion for model '" + model + "'; " + api_complaint(parsed, raw))
                 some(content) => ok(LLMResponse { content: string.trim(content), model: model,
-                  usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                  finish_reason: "stop", tool_calls: [], sampling: sampling_of(opts) })
+                  usage: usage_of(parsed),
+                  finish_reason: finish_reason_of(parsed), tool_calls: [], sampling: sampling_of(opts) })
               }
             }
           }
