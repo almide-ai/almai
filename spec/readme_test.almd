@@ -28,7 +28,7 @@ test "response helpers" {
   let u = Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
   let r = LLMResponse {
     content: "{\"x\":1}", model: "test", usage: u,
-    finish_reason: "stop", tool_calls: [],
+    finish_reason: "stop", tool_calls: [], sampling: Sampling { },
   }
   assert_eq(almai.has_tool_calls(r), false)
   assert_eq(r.usage.total_tokens, 15)

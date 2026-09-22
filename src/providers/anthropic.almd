@@ -11,10 +11,28 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
+
+// What this provider actually writes. `max_tokens` is the only sampling
+// control on the wire here: the Messages API body built below carries no
+// `temperature` and no `top_p`, so both report as unsent. (The Messages API
+// itself accepts temperature and top_p; it has no `seed` at all, which is
+// why seed_sent can never become true on this provider.)
+fn sampling_of(opts: CallOptions) -> Sampling =
+  Sampling { max_tokens_sent: true, max_tokens: opts.max_tokens }
 
 // Anthropic wire format: assistant tool_use lives in `content` as a block
 // array, and tool results come back as role:"user" with a `tool_result`
@@ -107,7 +125,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
               Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
                 completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
                 total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) } },
-            finish_reason: es(parsed, "stop_reason"), tool_calls: tc })
+            finish_reason: es(parsed, "stop_reason"), tool_calls: tc, sampling: sampling_of(opts) })
         }
       }
     }
@@ -161,6 +179,7 @@ effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, 
               },
               finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("end_turn"),
               tool_calls: tool_calls,
+              sampling: sampling_of(opts),
             })
           }
         }

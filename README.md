@@ -64,6 +64,46 @@ let opts = almai.defaults()
 let r = almai.call_with("openai/gpt-4o", msgs, opts)!
 ```
 
+`defaults()` uses `temperature: 0.0` — almai is built for measurement, and a
+benchmark that resamples on every run measures the sampler as much as the
+thing under test. Pass `with_temperature` for prose.
+
+## Reproducible sampling
+
+`with_seed` pins the sampler; `0` (the default) means "no seed", so a caller
+who never asked for one never silently gets one.
+
+```almide
+let opts = almai.defaults() |> almai.with_seed(7)
+let r = almai.call_with("cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast", msgs, opts)!
+```
+
+**A dropped option must not look like an honoured one.** Providers differ in
+what they put on the wire, so every response reports what it actually sent:
+
+```almide
+r.sampling.seed_sent          // Bool — was `seed` written into the request?
+r.sampling.seed               // Int  — the value that went out (0 if unsent)
+r.sampling.temperature_sent   // ... same shape for temperature / top_p /
+r.sampling.max_tokens_sent    //     max_tokens
+```
+
+A manifest can therefore print `seed: 7` versus `seed: null (not sent)`
+instead of quoting `CallOptions` and implying a pinned run that never was.
+
+| Provider | max_tokens | temperature | top_p | seed |
+|---|---|---|---|---|
+| `cf/` | ✓ | ✓ | ✓ | ✓ |
+| `openai/`, `openrouter/`, `groq/` | ✓ | ✓ | — | — |
+| `anthropic/`, `azure/`, `google/`, `bedrock/` | ✓ | — | — | — |
+| `cli/` | — | — | — | — |
+
+`seed_sent: true` means the field reached the API, **not** that the model
+honoured it — no text-generation API reports back which sampling controls it
+applied, and Cloudflare's GLM models document seed as "best effort". Whether
+a given model respects a seed is established by running the same
+`(model, seed, temperature, task set)` twice and comparing.
+
 ## JSON mode
 
 ```almide

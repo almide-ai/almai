@@ -44,6 +44,36 @@ type LLMResponse = {
   usage: Usage,
   finish_reason: String,
   tool_calls: List[ToolCall],
+  // What the provider ACTUALLY put on the wire for this call. Deliberately
+  // NOT defaulted: a field a provider may quietly leave blank is the same
+  // shape as the bug this fixes — a declaration nobody honours. Making it
+  // mandatory means a new provider has to answer "what did you send?"
+  // before it compiles. Never infer "the model honoured X" from
+  // CallOptions; read this.
+  sampling: Sampling,
+}
+
+// Sampling echo: the request-side half of reproducibility.
+//
+// `*_sent` says the field was written into the request body, NOT that the
+// model honoured it. No text-generation API reports back which sampling
+// controls it actually applied, so "honoured" can only be established
+// empirically: run the same (model, seed, temperature, task set) twice and
+// compare. A manifest can therefore print `seed: 7` when `seed_sent` is
+// true, and `seed: null` when it is false — and, when two runs with
+// `seed_sent: true` disagree, record that THIS model ignored the seed.
+//
+// The point of the record is that the two cases stop looking alike: before
+// it, a caller could not tell a pinned run from an unpinned one.
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
 }
 
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
@@ -101,9 +131,9 @@ fn with_stop(opts: CallOptions, sequences: List[String]) -> CallOptions = { ...o
 fn with_tools(opts: CallOptions, ts: List[Tool]) -> CallOptions = { ...opts, tools: ts }
 fn with_json_mode(opts: CallOptions) -> CallOptions = { ...opts, json_mode: true }
 // Pin the sampler. Cloudflare Workers AI accepts 1..=9_999_999_999; passing
-// 0 means "no seed" (see CallOptions.seed). Whether a given model then
-// honours it is a per-model fact, established by running twice — not
-// something a request can assert.
+// 0 means "no seed" (see CallOptions.seed). Whether the model then honours
+// it is a per-model fact — check `r.sampling.seed_sent` for what went out,
+// and two identical runs for whether it was respected.
 fn with_seed(opts: CallOptions, n: Int) -> CallOptions = { ...opts, seed: n }
 
 // ── Provider parsing ──
@@ -302,8 +332,16 @@ test "with_tools" {
 test "has_tool_calls false" {
   let r = LLMResponse { content: "hi", model: "m",
     usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    finish_reason: "stop", tool_calls: [] }
+    finish_reason: "stop", tool_calls: [], sampling: Sampling { } }
   assert_eq(has_tool_calls(r), false)
+}
+
+test "an unfilled sampling echo claims nothing" {
+  let s = Sampling { }
+  assert_eq(s.seed_sent, false)
+  assert_eq(s.temperature_sent, false)
+  assert_eq(s.top_p_sent, false)
+  assert_eq(s.max_tokens_sent, false)
 }
 
 test "is_retriable_error true for HTTP 429" {
@@ -332,7 +370,7 @@ test "is_retriable_error false for missing env" {
 test "parse_content_as_json" {
   let r = LLMResponse { content: "{\"x\":1}", model: "m",
     usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    finish_reason: "stop", tool_calls: [] }
+    finish_reason: "stop", tool_calls: [], sampling: Sampling { } }
   match parse_content_as_json(r) {
     ok(v) => assert_eq(json.get_int(v, "x") |> option.unwrap_or(0), 1)
     err(_) => assert(false)
