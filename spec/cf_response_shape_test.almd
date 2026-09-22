@@ -1,0 +1,64 @@
+// cf_response_shape_test — ONE endpoint, TWO response shapes.
+//
+// `/ai/run/{model}` does not answer in a single shape. The llama family
+// returns `result.response`; Zhipu's GLM family returns the OpenAI-shaped
+// `result.choices[0].message.content`. The provider read only the first, so
+// every GLM reply was reported as an empty completion while the model was
+// answering correctly — measured 2026-09-22, a whole cross-language run lost
+// to it.
+//
+// The reason it went unnoticed is the reason these tests exist: the only
+// models ever measured through this provider returned the shape the reader
+// understood. A shape nobody sends cannot fail. So both shapes are cells
+// here, and so are the ways a body can carry no answer at all.
+
+import self.providers.cloudflare as cf
+import json
+
+test "the llama shape: result.response is the completion" {
+  let body = json.parse("{\"result\":{\"response\":\"fn f() -> Int = 1\"}}")!
+  assert((cf.completion_text(body) ?? "<none>") == "fn f() -> Int = 1", "expected fn f() -> Int = 1")
+}
+
+test "the chat shape: result.choices[0].message.content is the completion" {
+  let body = json.parse(
+    "{\"result\":{\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"content\":\"fn g() -> Int = 2\"}}]}}",
+  )!
+  assert((cf.completion_text(body) ?? "<none>") == "fn g() -> Int = 2", "expected fn g() -> Int = 2")
+}
+
+// GLM sends its scratchpad beside the answer. Picking the wrong sibling would
+// score the model's thinking as its program, which compiles to nothing and
+// reads as a model failure.
+test "reasoning_content is not the completion" {
+  let body = json.parse(
+    "{\"result\":{\"choices\":[{\"message\":{\"content\":\"fn h() -> Int = 3\",\"reasoning_content\":\"The task is simple\"}}]}}",
+  )!
+  assert((cf.completion_text(body) ?? "<none>") == "fn h() -> Int = 3", "expected fn h() -> Int = 3")
+}
+
+test "response wins when a body somehow carries both" {
+  let body = json.parse(
+    "{\"result\":{\"response\":\"plain\",\"choices\":[{\"message\":{\"content\":\"chat\"}}]}}",
+  )!
+  assert((cf.completion_text(body) ?? "<none>") == "plain", "expected plain")
+}
+
+// The three ways there is genuinely no answer. Each must be `none` so the
+// caller raises a harness error instead of scoring an empty program.
+test "an error body has no completion" {
+  let body = json.parse(
+    "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"result\":null}",
+  )!
+  assert((cf.completion_text(body) ?? "<none>") == "<none>", "expected <none>")
+}
+
+test "an empty choices array has no completion" {
+  let body = json.parse("{\"result\":{\"choices\":[]}}")!
+  assert((cf.completion_text(body) ?? "<none>") == "<none>", "expected <none>")
+}
+
+test "a choice without a message has no completion" {
+  let body = json.parse("{\"result\":{\"choices\":[{\"index\":0}]}}")!
+  assert((cf.completion_text(body) ?? "<none>") == "<none>", "expected <none>")
+}

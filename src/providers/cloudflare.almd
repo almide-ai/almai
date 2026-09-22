@@ -145,6 +145,34 @@ effect fn require_env(key: String) -> Result[String, String] =
 effect fn resolve_account() -> Result[String, String] =
   match require_env("CF_ACCOUNT_ID") { ok(v) => ok(v), err(_) => require_env("CLOUDFLARE_ACCOUNT_ID") }
 
+// TWO RESPONSE SHAPES BEHIND ONE ENDPOINT.
+//
+// `/ai/run/{model}` does not answer in one shape. The llama family returns
+// `result.response` (a plain string). Zhipu's GLM family returns the
+// OpenAI-shaped `result.choices[0].message.content`, alongside a
+// `reasoning_content` sibling that is the model's scratchpad and NOT the
+// answer. Reading only `result.response` made every GLM reply look like an
+// empty completion — the model was answering correctly the whole time
+// (measured 2026-09-22: `fn clamp(value: Int, low: Int, high: Int) -> Int =
+// int.clamp(value, low, high)` reported as "no completion").
+//
+// Try `response` first, because that is the older and more common shape, then
+// the chat shape. A provider that gains a third shape gets another arm here,
+// not a second reader somewhere else.
+fn completion_text(parsed: Value) -> Option[String] =
+  match value.field(parsed, "result")? {
+    none => none,
+    some(r) => match json.get_string(r, "response") {
+      some(t) => some(t),
+      none => {
+        let choices = json.get_array(r, "choices") ?? []
+        list.first(choices)
+          |> option.flat_map((c) => value.field(c, "message")?)
+          |> option.flat_map((m) => json.get_string(m, "content"))
+      },
+    },
+  }
+
 // WHAT CLOUDFLARE SAID, not just that it said nothing.
 //
 // The REST surface answers a bad credential, an exhausted quota, a model the
@@ -185,8 +213,8 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
             err(e) => err("cloudflare: http: " + e)
             ok(raw) => match json.parse(raw) {
               err(e) => err("cloudflare: json: " + e)
-              ok(parsed) => match value.field(parsed, "result")? |> option.flat_map((r) => json.get_string(r, "response")) {
-                none => err("cloudflare: no result.response for model '" + model + "'; " + api_complaint(parsed, raw))
+              ok(parsed) => match completion_text(parsed) {
+                none => err("cloudflare: no completion for model '" + model + "'; " + api_complaint(parsed, raw))
                 some(content) => ok(LLMResponse { content: string.trim(content), model: model,
                   usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                   finish_reason: "stop", tool_calls: [], sampling: sampling_of(opts) })
