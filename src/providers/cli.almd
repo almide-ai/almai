@@ -24,12 +24,30 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+// `claude -p` / `codex exec` expose no sampling flags, so every field of
+// the echo stays false here: this provider genuinely sends nothing from
+// CallOptions' sampling set, and a caller measuring through it cannot pin
+// the sampler at all. `nothing_sent()` below says exactly that, out loud.
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
 
 // ── Helpers ──
+
+// The CLIs take no sampling arguments at all, so this is the honest echo
+// for both of them: nothing from CallOptions reached the model.
+fn nothing_sent() -> Sampling = Sampling { }
 
 fn resolve_system(msgs: List[Message], opts: CallOptions) -> String =
   if opts.system != "" then opts.system
@@ -69,7 +87,7 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
     err(_) => LLMResponse {
       content: string.trim(raw), model: "claude-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      finish_reason: "stop", tool_calls: [],
+      finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
     }
     ok(v) => {
       let result_text = json.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
@@ -80,7 +98,7 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
       LLMResponse {
         content: string.trim(result_text), model: model,
         usage: Usage { prompt_tokens: in_tok, completion_tokens: out_tok, total_tokens: in_tok + out_tok },
-        finish_reason: "stop", tool_calls: [],
+        finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
       }
     }
   }
@@ -110,7 +128,7 @@ effect fn call_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMRespon
     ok(raw) => ok(LLMResponse {
       content: string.trim(raw), model: "codex-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      finish_reason: "stop", tool_calls: [],
+      finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
     })
   }
 }

@@ -10,11 +10,28 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type ToolCall = { id: String, name: String, arguments: String }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
 type Tool = { name: String, description: String, parameters: Value }
+
+// generationConfig below carries maxOutputTokens and nothing else, so
+// max_tokens is the only control that reports as sent. Gemini's
+// generationConfig does accept temperature / topP / seed; wiring them is a
+// separate change, and until then this says so rather than implying it.
+fn sampling_of(opts: CallOptions) -> Sampling =
+  Sampling { max_tokens_sent: true, max_tokens: opts.max_tokens }
 
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
@@ -46,7 +63,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
               |> option.unwrap_or("")
             ok(LLMResponse { content: string.trim(content), model: model,
               usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-              finish_reason: "stop", tool_calls: [] })
+              finish_reason: "stop", tool_calls: [], sampling: sampling_of(opts) })
           }
         }
       }

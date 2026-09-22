@@ -1,4 +1,27 @@
 // almai.providers.cloudflare — Cloudflare Workers AI
+//
+// Why this file still builds its own body instead of reusing
+// `providers.openai` against Workers AI's OpenAI-compatible endpoint
+// (`.../ai/v1/chat/completions`), which `mod.almd` already points at
+// OpenRouter and Groq:
+//
+//   - Different credential. This provider authenticates with the Global API
+//     Key pair (X-Auth-Key + X-Auth-Email); the compat endpoint documents
+//     `Authorization: Bearer <API token>`. Switching would change the env
+//     contract of the lane whose reproducibility this fix is about.
+//   - It would not deliver the fix. `openai.build_body` sends neither
+//     `top_p` nor `seed`, so routing through it would leave seed unsent —
+//     the defect in almide-ai/almai#7 — unless openai.almd changes too,
+//     which would move the openai / openrouter / groq lanes as well.
+//   - Cloudflare's compat-endpoint docs do not enumerate which body
+//     parameters they forward, so "seed survives the compat layer" is not
+//     something this change can assert without an account to measure on.
+//
+// This is not a copy of openai.build_body: `/ai/run/{model}` puts the model
+// in the URL, not the body, and the sampling set differs. The duplication
+// worth removing is real but larger than this fix — moving `cf/` onto the
+// compat endpoint would also buy real token usage (this path reports zeros)
+// and tool calls, and it needs its own measured before/after.
 
 import env
 import http
@@ -10,7 +33,17 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type ToolCall = { id: String, name: String, arguments: String }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
@@ -19,6 +52,92 @@ type Tool = { name: String, description: String, parameters: Value }
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) =>
     value.object([("role", value.str(m.role)), ("content", value.str(m.content))])))
+
+// ── Sampling ──
+//
+// One predicate, two readers. `build_body` writes the wire body and
+// `sampling_of` writes the echo that rides back on LLMResponse.sampling;
+// both ask `sends_seed` and nothing else, so "we reported it as sent" and
+// "it is in the body" cannot drift apart. A new knob adds a predicate here,
+// never a second rule at one of the two sites.
+//
+// `seed: 0` is CallOptions' "unset" sentinel: Cloudflare documents the
+// valid range as 1..=9_999_999_999, so 0 can never be a legitimate seed.
+fn sends_seed(opts: CallOptions) -> Bool = opts.seed != 0
+
+// Build the Workers AI request body. Deliberately a pure function, like
+// openai.build_body / anthropic.build_body, so a test can read exactly what
+// goes on the wire without an HTTP call. The bug this replaces — a
+// CallOptions full of knobs and a body of `{"messages": [...]}` — was
+// invisible to every test that only looked at the response.
+//
+// `/ai/run/{model}` serves two different input schemas depending on the
+// model, so the spellings below are the INTERSECTION of both:
+//
+//   Llama family, e.g. @cf/meta/llama-3.3-70b-instruct-fp8-fast
+//     temperature  number,  0..=5                (Cloudflare's default: 0.6)
+//     top_p        number,  0.001..=1
+//     max_tokens   integer                       (Cloudflare's default: 256)
+//     seed         integer, 1..=9_999_999_999    "Random seed for
+//                                                 reproducibility of the
+//                                                 generation"
+//   https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/
+//
+//   GLM family, e.g. @cf/zai-org/glm-5.3-flash — OpenAI-shaped
+//     temperature            number|null,  0..=2
+//     top_p                  number|null
+//     seed                   integer|null  "If specified, the system will
+//                                           make a BEST EFFORT to sample
+//                                           deterministically"
+//     max_tokens             integer|null  DEPRECATED in favour of
+//                                          max_completion_tokens
+//     max_completion_tokens  integer|null
+//   https://developers.cloudflare.com/workers-ai/models/glm-5.3-flash/
+//
+// We send `max_tokens`, not `max_completion_tokens`: it is the only token
+// cap both families accept today. The Llama schema — which is what the
+// daily measurement lane runs — does not list `max_completion_tokens` at
+// all, and deprecated is not removed. When Cloudflare does remove it, a GLM
+// call would silently fall back to the vendor cap, so this is worth a
+// per-family spelling before then, not after.
+//
+// GLM's own wording for seed ("best effort") is why LLMResponse.sampling
+// reports what was SENT and never claims it was honoured.
+//
+// temperature / top_p / max_tokens go out unconditionally. That matches
+// openai.build_body, which sends its scalars unconditionally and keeps the
+// "omit when empty" convention for the list- and flag-shaped options; it is
+// also the whole point of the fix, because a field we omit is not neutral,
+// it is the vendor's default — 0.6, not our 0.0.
+//
+// Values are NOT clamped to the ranges above, and note the ranges differ
+// per family (temperature 0..=5 on Llama, 0..=2 on GLM). An out-of-range
+// value comes back as an HTTP error from Cloudflare, and a loud rejection
+// beats a silently altered sampler — silently altering the sampler is the
+// exact class of defect this file is fixing.
+fn build_body(msgs: List[Message], opts: CallOptions) -> Value = {
+  let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
+  let fields = [
+    ("messages", messages_to_json(sys_msgs + msgs)),
+    ("max_tokens", value.int(opts.max_tokens)),
+    ("temperature", value.float(opts.temperature)),
+    ("top_p", value.float(opts.top_p)),
+  ]
+  let fields = if sends_seed(opts) then fields + [("seed", value.int(opts.seed))] else fields
+  value.object(fields)
+}
+
+// What this provider actually put on the wire, for the caller's manifest.
+// `seed_sent: false` is how "seed: null" gets recorded honestly. It never
+// claims the MODEL honoured anything — see the Sampling comment in mod.almd.
+fn sampling_of(opts: CallOptions) -> Sampling =
+  Sampling {
+    temperature_sent: true, temperature: opts.temperature,
+    top_p_sent: true, top_p: opts.top_p,
+    max_tokens_sent: true, max_tokens: opts.max_tokens,
+    seed_sent: sends_seed(opts),
+    seed: if sends_seed(opts) then opts.seed else 0,
+  }
 
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
@@ -34,9 +153,8 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       ok(api_key) => match require_env("CLOUDFLARE_EMAIL") {
         err(_) => err("cloudflare: need CLOUDFLARE_EMAIL for Global API Key auth")
         ok(email) => {
-          let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
           let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
-          let body = json.stringify(value.object([("messages", messages_to_json(sys_msgs + msgs))]))
+          let body = json.stringify(build_body(msgs, opts))
           match http.request("POST", url, body, ["X-Auth-Key": api_key, "X-Auth-Email": email, "Content-Type": "application/json"]) {
             err(e) => err("cloudflare: http: " + e)
             ok(raw) => match json.parse(raw) {
@@ -45,7 +163,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
                 let content = value.field(parsed, "result")? |> option.flat_map((r) => json.get_string(r, "response")) |> option.unwrap_or("")
                 ok(LLMResponse { content: string.trim(content), model: model,
                   usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                  finish_reason: "stop", tool_calls: [] })
+                  finish_reason: "stop", tool_calls: [], sampling: sampling_of(opts) })
               }
             }
           }

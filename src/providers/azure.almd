@@ -10,11 +10,27 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type ToolCall = { id: String, name: String, arguments: String }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
+
+// What the body below actually carries: max_tokens only. temperature,
+// top_p and seed are not written, so they report unsent rather than
+// looking honoured.
+fn sampling_of(opts: CallOptions) -> Sampling =
+  Sampling { max_tokens_sent: true, max_tokens: opts.max_tokens }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) =>
@@ -61,7 +77,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
                   completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
                   total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) },
                 finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"),
-                tool_calls: parse_tool_calls(msg) })
+                tool_calls: parse_tool_calls(msg), sampling: sampling_of(opts) })
             }
           }
         }

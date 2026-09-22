@@ -11,10 +11,34 @@ type Message = {
   tool_call_id: String = "",
   tool_calls: List[ToolCall] = [],
 }
-type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall], sampling: Sampling }
+type Sampling = {
+  temperature_sent: Bool = false,
+  temperature: Float = 0.0,
+  top_p_sent: Bool = false,
+  top_p: Float = 0.0,
+  max_tokens_sent: Bool = false,
+  max_tokens: Int = 0,
+  seed_sent: Bool = false,
+  seed: Int = 0,
+}
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
+
+// What `build_body` actually writes — not what CallOptions offers. This
+// provider sends max_tokens and temperature and nothing else from the
+// sampling set, so `top_p_sent` / `seed_sent` are false and a caller's
+// manifest says so instead of quietly implying a pinned sampler.
+//
+// OpenAI Chat Completions does accept `seed` and `top_p`; teaching this
+// provider to send them is a separate change, because build_body is shared
+// with the openrouter and groq lanes and would move their numbers too.
+fn sampling_of(opts: CallOptions) -> Sampling =
+  Sampling {
+    temperature_sent: true, temperature: opts.temperature,
+    max_tokens_sent: true, max_tokens: opts.max_tokens,
+  }
 
 // Emit a single tool_call as the OpenAI Chat Completions wire shape:
 //   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
@@ -101,7 +125,8 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
       let msg = value.field(choice, "message")? |> option.unwrap_or(value.null())
       ok(LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
         model: json.get_string(parsed, "model") |> option.unwrap_or(""), usage: parse_usage(parsed),
-        finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg) })
+        finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg),
+        sampling: sampling_of(opts) })
     }
   }
 }
@@ -147,6 +172,7 @@ effect fn call_streaming(
           },
           finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("stop"),
           tool_calls: tool_calls,
+          sampling: sampling_of(opts),
         })
       }
     }
