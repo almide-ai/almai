@@ -13,7 +13,7 @@ type Message = {
 type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type ToolCall = { id: String, name: String, arguments: String }
-type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
+type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool, seed: Int = 0 }
 type Tool = { name: String, description: String, parameters: Value }
 
 fn messages_to_json(msgs: List[Message]) -> Value =

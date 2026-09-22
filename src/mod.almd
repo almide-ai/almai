@@ -58,6 +58,11 @@ type CallOptions = {
   stop: List[String],
   tools: List[Tool],
   json_mode: Bool,
+  // 0 = unset, so a caller who never asked for a seed never gets one
+  // silently pinned. 0 is safe as the sentinel because Cloudflare Workers
+  // AI documents the valid seed range as 1..=9_999_999_999, so 0 can never
+  // be a legitimate seed. Set it with `with_seed`.
+  seed: Int = 0,
 }
 
 // ── Message constructors ──
@@ -72,8 +77,21 @@ fn tool_result(tool_call_id: String, content: String) -> Message =
 
 // ── Options builder ──
 
+// `temperature: 0.0` is the measurement default, and it is a deliberate
+// choice, not an inherited zero value: almai is the transport for the MSR
+// numbers that go in almide's README, and a benchmark that resamples the
+// model on every run measures the sampler as much as the language. Callers
+// who want prose, not measurement, opt in with `with_temperature`.
+//
+// It also has to be SENT to mean anything: a provider that drops it falls
+// back to the vendor's own default, which is not 0 (Cloudflare Workers AI
+// documents 0.6). That is the exact defect almide-ai/almai#7 records.
+//
+// `seed: 0` means unset. There is deliberately no default seed: pinning one
+// here would make every caller's runs silently correlated, and a seed the
+// caller did not choose is not reproducibility, it is a hidden constant.
 fn defaults() -> CallOptions =
-  CallOptions { max_tokens: 4096, temperature: 0.0, top_p: 1.0, system: "", stop: [], tools: [], json_mode: false }
+  CallOptions { max_tokens: 4096, temperature: 0.0, top_p: 1.0, system: "", stop: [], tools: [], json_mode: false, seed: 0 }
 
 fn with_max_tokens(opts: CallOptions, n: Int) -> CallOptions = { ...opts, max_tokens: n }
 fn with_temperature(opts: CallOptions, t: Float) -> CallOptions = { ...opts, temperature: t }
@@ -82,6 +100,11 @@ fn with_system(opts: CallOptions, s: String) -> CallOptions = { ...opts, system:
 fn with_stop(opts: CallOptions, sequences: List[String]) -> CallOptions = { ...opts, stop: sequences }
 fn with_tools(opts: CallOptions, ts: List[Tool]) -> CallOptions = { ...opts, tools: ts }
 fn with_json_mode(opts: CallOptions) -> CallOptions = { ...opts, json_mode: true }
+// Pin the sampler. Cloudflare Workers AI accepts 1..=9_999_999_999; passing
+// 0 means "no seed" (see CallOptions.seed). Whether a given model then
+// honours it is a per-model fact, established by running twice — not
+// something a request can assert.
+fn with_seed(opts: CallOptions, n: Int) -> CallOptions = { ...opts, seed: n }
 
 // ── Provider parsing ──
 
@@ -264,6 +287,11 @@ test "options builder" {
   assert_eq(opts.system, "sys")
   assert_eq(opts.json_mode, true)
   assert_eq(list.len(opts.stop), 1)
+}
+
+test "with_seed / seed default" {
+  assert_eq(defaults().seed, 0)
+  assert_eq((defaults() |> with_seed(7)).seed, 7)
 }
 
 test "with_tools" {
