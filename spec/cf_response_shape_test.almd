@@ -62,3 +62,52 @@ test "a choice without a message has no completion" {
   let body = json.parse("{\"result\":{\"choices\":[{\"index\":0}]}}")!
   assert((cf.completion_text(body) ?? "<none>") == "<none>", "expected <none>")
 }
+
+// ── What the response says about itself ──
+//
+// `finish_reason` and `usage` were not read at all: the provider wrote
+// `"stop"` and three zeros into every response. Both are fields a caller
+// reads to decide whether to TRUST the completion, so a constant there is
+// worse than an absent field — it answers the question being asked.
+
+test "a truncated generation says so, instead of reporting stop" {
+  let body = json.parse(
+    "{\"result\":{\"choices\":[{\"finish_reason\":\"length\",\"message\":{\"content\":\"fn f() -> Int =\"}}]}}",
+  )!
+  assert(cf.finish_reason_of(body) == "length", "a budget-exhausted generation must not read as stop")
+}
+
+test "a finished generation reports stop because the body said so" {
+  let body = json.parse(
+    "{\"result\":{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"fn f() -> Int = 1\"}}]}}",
+  )!
+  assert(cf.finish_reason_of(body) == "stop", "expected stop")
+}
+
+// The older shape carries no finish reason. "" means "not reported"; the
+// one answer it must never give is the good case, which is what a caller
+// would have to disprove.
+test "a shape with no finish reason reports none, not stop" {
+  let body = json.parse("{\"result\":{\"response\":\"fn f() -> Int = 1\"}}")!
+  assert(cf.finish_reason_of(body) == "", "an unreported finish reason is empty, never stop")
+}
+
+test "an error body reports no finish reason" {
+  let body = json.parse("{\"success\":false,\"errors\":[{\"code\":10000}],\"result\":null}")!
+  assert(cf.finish_reason_of(body) == "", "expected empty")
+}
+
+test "usage is read from the body when the body reports it" {
+  let body = json.parse(
+    "{\"result\":{\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22,\"total_tokens\":33},\"choices\":[{\"message\":{\"content\":\"x\"}}]}}",
+  )!
+  let u = cf.usage_of(body)
+  assert(u.prompt_tokens == 11, "prompt_tokens must come from the body")
+  assert(u.completion_tokens == 22, "completion_tokens must come from the body")
+  assert(u.total_tokens == 33, "total_tokens must come from the body")
+}
+
+test "a body that reports no usage stays at zero" {
+  let u = cf.usage_of(json.parse("{\"result\":{\"response\":\"x\"}}")!)
+  assert(u.total_tokens == 0, "an unreported usage is zero")
+}
