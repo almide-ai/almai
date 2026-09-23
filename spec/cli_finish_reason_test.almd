@@ -1,0 +1,38 @@
+// cli_finish_reason_test — the CLI provider read the response and then
+// ignored the one field a caller checks.
+//
+// `parse_claude_json` pulled `result`, `usage` and `session_id` out of the
+// JSON and wrote `finish_reason: "stop"` anyway — and so did the branch where
+// the JSON failed to parse. A run stopped by a turn limit and a run that
+// finished were reported identically, and so was a response we could not read.
+
+import self.providers.cli
+import json
+
+test "a turn-limited run says so instead of reporting stop" {
+  let v = json.parse("{\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"partial\"}")!
+  assert(cli.claude_finish_reason(v) == "error_max_turns", "a turn limit must not read as stop")
+}
+
+test "a successful run reports stop because the body said success" {
+  let v = json.parse("{\"subtype\":\"success\",\"is_error\":false,\"result\":\"fn f() -> Int = 1\"}")!
+  assert(cli.claude_finish_reason(v) == "stop", "expected stop")
+}
+
+// An error with no subtype is still an error, not a clean stop.
+test "is_error without a subtype reports error" {
+  let v = json.parse("{\"is_error\":true,\"result\":\"boom\"}")!
+  assert(cli.claude_finish_reason(v) == "error", "expected error")
+}
+
+// "" is NOT REPORTED. The one answer it must never give is the good case,
+// which is the answer a caller would otherwise have to disprove.
+test "a body that reports neither says nothing, not stop" {
+  let v = json.parse("{\"result\":\"fn f() -> Int = 1\"}")!
+  assert(cli.claude_finish_reason(v) == "", "an unreported finish reason is empty, never stop")
+}
+
+test "an unrecognised subtype is passed through verbatim" {
+  let v = json.parse("{\"subtype\":\"error_during_execution\"}")!
+  assert(cli.claude_finish_reason(v) == "error_during_execution", "expected the subtype verbatim")
+}
