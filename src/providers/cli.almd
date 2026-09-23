@@ -79,6 +79,27 @@ fn render_history(msgs: List[Message]) -> String = {
   }
 }
 
+// WHY THE RUN ENDED, when the CLI says.
+//
+// `claude --output-format json` reports `subtype` ("success",
+// "error_max_turns", "error_during_execution") and `is_error`. This file read
+// `result`, `usage` and `session_id` out of that same object and then wrote
+// `finish_reason: "stop"` regardless — including in the branch where the JSON
+// FAILED to parse, so a response we could not read at all was reported as a
+// clean stop.
+//
+// "" means NOT REPORTED. It is never "stop", because "stop" is the one answer
+// a caller uses to rule out the failure it is checking for: a run cut short by
+// a turn limit arrives looking exactly like a finished one, and the only thing
+// that separates them is this field. `codex exec` has no structured output at
+// all, so there is genuinely nothing to read and "" is the honest answer there
+// too.
+fn claude_finish_reason(v: Value) -> String =
+  match json.get_string(v, "subtype") {
+    some(s) => if s == "success" then "stop" else s,
+    none => if json.get_bool(v, "is_error") ?? false then "error" else "",
+  }
+
 // Parse a `claude --output-format json` response, falling back to
 // raw-text on JSON parse failure (in case an older claude version
 // or a non-JSON build of the CLI is installed).
@@ -87,7 +108,7 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
     err(_) => LLMResponse {
       content: string.trim(raw), model: "claude-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
+      finish_reason: "", tool_calls: [], sampling: nothing_sent(),
     }
     ok(v) => {
       let result_text = json.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
@@ -98,7 +119,7 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
       LLMResponse {
         content: string.trim(result_text), model: model,
         usage: Usage { prompt_tokens: in_tok, completion_tokens: out_tok, total_tokens: in_tok + out_tok },
-        finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
+        finish_reason: claude_finish_reason(v), tool_calls: [], sampling: nothing_sent(),
       }
     }
   }
@@ -128,7 +149,7 @@ effect fn call_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMRespon
     ok(raw) => ok(LLMResponse {
       content: string.trim(raw), model: "codex-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      finish_reason: "stop", tool_calls: [], sampling: nothing_sent(),
+      finish_reason: "", tool_calls: [], sampling: nothing_sent(),
     })
   }
 }
