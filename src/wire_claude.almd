@@ -99,29 +99,39 @@ fn object_in(text: String) -> Value? =
     _ => none,
   }
 
-// claude -p --output-format json prints one object: the answer in structured_output
-// (with a schema) or in result, or is_error with what went wrong. Read as the answer and
-// the session id; the cost claude reports is the meter.
+// What an exit with no JSON to read means.
+fn exit_failure(code: Int, out: String, said: String) -> core.LlmError =
+  if code == 127 then core.ErrConfig("claude is not installed (no `claude` on PATH)")
+  else if code == 143 or code == 137 then core.ErrCancelled
+  else core.ErrUnreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))
+
+// The answer in a reply: structured_output with a schema; with tools, the JSON object
+// the protocol asks for, written in the text; plain words otherwise, or when the model
+// answered in words after all.
+fn answer_of(r: Value, tools: Bool) -> (String, List[wire.ToolCall]) = {
+  let text = str_of(r, "result")
+  match value.field(r, "structured_output") {
+    ok(so) => (json.stringify(so), []),
+    err(_) => if not tools then (text, [])
+      else match object_in(text) {
+        some(v) => if option.is_some(json.get_array(v, "tool_calls")) or option.is_some(json.get_string(v, "content")) then
+            (str_of(v, "content"), list.map(json.get_array(v, "tool_calls") ?? [], (c) =>
+              wire.ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.field(c, "arguments") ?? value.object([])) }))
+          else (text, []),
+        none => (text, []),
+      },
+  }
+}
+
+// claude -p --output-format json prints one object: the answer, or is_error with what
+// went wrong. Read as the answer and the session id; the cost claude reports is the meter.
 fn read(out: String, code: Int, said: String, tools: Bool) -> Result[(wire.Folded, String), core.LlmError] =
   match json.parse(string.trim(out)) {
-    err(_) => err(if code == 127 then core.ErrConfig("claude is not installed (no `claude` on PATH)")
-      else if code == 143 or code == 137 then core.ErrCancelled
-      else core.ErrUnreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
+    err(_) => err(exit_failure(code, out, said)),
     // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
     ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
       else {
-        let text = str_of(r, "result")
-        let (content, calls) = match value.field(r, "structured_output") {
-          ok(so) => (json.stringify(so), []),
-          err(_) => if not tools then (text, [])
-            else match object_in(text) {
-              some(v) => if option.is_some(json.get_array(v, "tool_calls")) or option.is_some(json.get_string(v, "content")) then
-                  (str_of(v, "content"), list.map(json.get_array(v, "tool_calls") ?? [], (c) =>
-                    wire.ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.field(c, "arguments") ?? value.object([])) }))
-                else (text, []),
-              none => (text, []),
-            },
-        }
+        let (content, calls) = answer_of(r, tools)
         ok((wire.Folded { content: content, reasoning: "", calls: calls, finish: str_of(r, "stop_reason"),
           usage: wire_anthropic.usage_of(wire.field_of(some(r), "usage")), meter: json.get_float(r, "total_cost_usd") ?? -1.0 }, str_of(r, "session_id")))
       },

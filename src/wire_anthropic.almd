@@ -148,48 +148,51 @@ fn answered(f: wire.Folded) -> wire.Folded = match list.find(f.calls, (c) => c.n
   none => f,
 }
 
+// A stream being read: the answer so far, which content block each tool call came
+// in (a block index to a position in `calls`), and the failure, once there is one.
+type Reading = { f: wire.Folded, blocks: List[(Int, Int)], failure: String }
+
+fn with_folded(r: Reading, f: wire.Folded) -> Reading = Reading { f: f, blocks: r.blocks, failure: r.failure }
+
+fn fold_event(r: Reading, ev: Value) -> Reading = {
+  let kind = wire.str_of(ev, "type")
+  if kind == "error" or (kind == "" and option.is_some(wire.field_of(some(ev), "error"))) then
+    Reading { f: r.f, blocks: r.blocks, failure: "api error: " + json.stringify(value.field(ev, "error") ?? ev) }
+  else if kind == "message_start" then with_folded(r, finished(r.f, "", usage_of(wire.field_of(wire.field_of(some(ev), "message"), "usage"))))
+  else if kind == "content_block_start" then {
+    let b = value.field(ev, "content_block") ?? value.object([])
+    let blocks = if wire.str_of(b, "type") == "tool_use" then r.blocks + [(json.get_int(ev, "index") ?? -1, list.len(r.f.calls))] else r.blocks
+    Reading { f: add_block(r.f, b), blocks: blocks, failure: r.failure }
+  }
+  else if kind == "content_block_delta" then {
+    let i = json.get_int(ev, "index") ?? -1
+    with_folded(r, add_delta(r.f, value.field(ev, "delta") ?? value.object([]), option.map(list.find(r.blocks, (b) => b.0 == i), (b) => b.1)))
+  }
+  else if kind == "message_delta" then
+    with_folded(r, finished(r.f, wire.str_of(value.field(ev, "delta") ?? value.object([]), "stop_reason"), usage_of(wire.field_of(some(ev), "usage"))))
+  // A reply that was not streamed: one message, its content whole.
+  else if kind == "message" then {
+    var f = r.f
+    for b in json.get_array(ev, "content") ?? [] { f = add_block(f, b) }
+    with_folded(r, finished(f, wire.str_of(ev, "stop_reason"), usage_of(wire.field_of(some(ev), "usage"))))
+  }
+  else r
+}
+
 // `schema_tool`: the request sent its schema as the "answer" tool (see `schema_as_tool`).
 fn fold(text: String, schema_tool: Bool) -> Result[wire.Folded, String] = {
-  var acc = wire.empty()
-  var failure = ""
-  // Content block index -> the position of its tool call in `calls`.
-  var blocks: List[(Int, Int)] = []
+  var r = Reading { f: wire.empty(), blocks: [], failure: "" }
   for p in wire.payloads(text) {
-    if failure == "" then {
+    if r.failure == "" then {
       match json.parse(p) {
-        err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
-        ok(ev) => {
-          let kind = wire.str_of(ev, "type")
-          if kind == "error" or (kind == "" and option.is_some(wire.field_of(some(ev), "error"))) then { failure = "api error: " + json.stringify(value.field(ev, "error") ?? ev) }
-          else if kind == "message_start" then {
-            let m = wire.field_of(some(ev), "message")
-            acc = finished(acc, "", usage_of(wire.field_of(m, "usage")))
-          }
-          else if kind == "content_block_start" then {
-            let b = value.field(ev, "content_block") ?? value.object([])
-            if wire.str_of(b, "type") == "tool_use" then list.push(blocks, (json.get_int(ev, "index") ?? -1, list.len(acc.calls))) else ()
-            acc = add_block(acc, b)
-          }
-          else if kind == "content_block_delta" then {
-            let i = json.get_int(ev, "index") ?? -1
-            acc = add_delta(acc, value.field(ev, "delta") ?? value.object([]), option.map(list.find(blocks, (b) => b.0 == i), (b) => b.1))
-          }
-          else if kind == "message_delta" then {
-            acc = finished(acc, wire.str_of(value.field(ev, "delta") ?? value.object([]), "stop_reason"), usage_of(wire.field_of(some(ev), "usage")))
-          }
-          // A reply that was not streamed: one message, its content whole.
-          else if kind == "message" then {
-            for b in json.get_array(ev, "content") ?? [] { acc = add_block(acc, b) }
-            acc = finished(acc, wire.str_of(ev, "stop_reason"), usage_of(wire.field_of(some(ev), "usage")))
-          }
-          else ()
-        },
+        err(e) => { r = Reading { f: r.f, blocks: r.blocks, failure: "unreadable answer: " + e + "; raw: " + string.take(p, 200) } },
+        ok(ev) => { r = fold_event(r, ev) },
       }
     } else ()
   }
   // A call to a tool that takes nothing streams no arguments at all.
-  let whole = with_calls(acc, list.map(acc.calls, (c) => wire.ToolCall { id: c.id, name: c.name, arguments: if c.arguments == "" then "{}" else c.arguments }))
-  if failure != "" then err(failure) else ok(if schema_tool then answered(whole) else whole)
+  let whole = with_calls(r.f, list.map(r.f.calls, (c) => wire.ToolCall { id: c.id, name: c.name, arguments: if c.arguments == "" then "{}" else c.arguments }))
+  if r.failure != "" then err(r.failure) else ok(if schema_tool then answered(whole) else whole)
 }
 
 fn msg(role: String, content: String) -> Value = value.object([("role", value.str(role)), ("content", value.str(content))])

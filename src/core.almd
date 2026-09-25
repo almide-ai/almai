@@ -23,13 +23,19 @@ type Finish = | FinishStop | FinishLength | FinishToolCalls | FinishFiltered | F
 
 // Every provider's word for it, in one table. A stop that came with tool calls is read
 // by the caller as ToolCalls (see `settled_finish`).
+let FINISH_WORDS = [
+  (["stop", "end_turn", "stop_sequence", "eos", "complete", "finish_reason_stop", ""], FinishStop),
+  (["length", "max_tokens", "max_output_tokens", "model_length", "model_context_window_exceeded"], FinishLength),
+  (["tool_calls", "tool_use", "function_call", "tool_call"], FinishToolCalls),
+  (["content_filter", "safety", "recitation", "refusal", "blocklist", "prohibited_content", "spii", "guardrail_intervened"], FinishFiltered),
+]
+
 fn finish_of(raw: String) -> Finish = {
   let r = string.to_lower(string.trim(raw))
-  if r == "stop" or r == "end_turn" or r == "stop_sequence" or r == "eos" or r == "complete" or r == "finish_reason_stop" or r == "" then FinishStop
-  else if r == "length" or r == "max_tokens" or r == "max_output_tokens" or r == "model_length" or r == "model_context_window_exceeded" then FinishLength
-  else if r == "tool_calls" or r == "tool_use" or r == "function_call" or r == "tool_call" then FinishToolCalls
-  else if r == "content_filter" or r == "safety" or r == "recitation" or r == "refusal" or r == "blocklist" or r == "prohibited_content" or r == "spii" or r == "guardrail_intervened" then FinishFiltered
-  else FinishOther(raw)
+  match list.find(FINISH_WORDS, (row) => list.contains(row.0, r)) {
+    some(row) => row.1,
+    none => FinishOther(raw),
+  }
 }
 
 fn settled_finish(raw: String, has_calls: Bool) -> Finish = match finish_of(raw) {

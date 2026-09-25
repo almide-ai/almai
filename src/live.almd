@@ -135,45 +135,59 @@ fn env_name(provider: String) -> String = string.to_upper(string.replace(provide
 
 effect fn env_of(key: String) -> String = string.trim(env.get(key) ?? "")
 
+// The first of these variables that is set, or "".
+effect fn first_env(keys: List[String]) -> String = {
+  var found = ""
+  for k in keys { if found == "" then { found = env_of(k)! } else () }
+  found
+}
+
+fn no_slash(base: String) -> String = string.strip_suffix(base, "/") ?? base
+
+fn cloudflare_endpoint(spec: String, model: String, account: String, token: String, email: String, key: String) -> Result[Endpoint, String] = {
+  let headers = if token != "" then ["Authorization: Bearer " + token]
+    else if email != "" and key != "" then ["X-Auth-Email: " + email, "X-Auth-Key: " + key] else []
+  if account == "" or list.is_empty(headers) then err("no Cloudflare credentials for " + spec + ": set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
+  else ok(Endpoint { kind: "chat", provider: "cf", url: "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/v1/chat/completions",
+    headers: headers, model_id: cf_id_of(model) })
+}
+
+fn anthropic_endpoint(spec: String, model: String, key: String, base: String) -> Result[Endpoint, String] =
+  if key == "" then err("no ANTHROPIC_API_KEY for " + spec)
+  else ok(Endpoint { kind: "anthropic", provider: "anthropic", url: no_slash(if base == "" then "https://api.anthropic.com" else base) + "/v1/messages",
+    headers: ["x-api-key: " + key, "anthropic-version: 2023-06-01"], model_id: model })
+
+fn gemini_endpoint(spec: String, model: String, key: String, base: String) -> Result[Endpoint, String] =
+  if key == "" then err("no GEMINI_API_KEY (or GOOGLE_API_KEY) for " + spec)
+  else ok(Endpoint { kind: "gemini", provider: "gemini",
+    url: no_slash(if base == "" then "https://generativelanguage.googleapis.com/v1beta" else base) + "/models/" + model + ":streamGenerateContent?alt=sse",
+    headers: ["x-goog-api-key: " + key], model_id: model })
+
+// Any OpenAI-compatible service: a known one, or NAME_BASE_URL.
+fn chat_endpoint(spec: String, provider: String, model: String, key: String, base: String) -> Result[Endpoint, String] = {
+  let name = env_name(provider)
+  let url = if base == "" then known_base(provider) else base
+  if url == "" then err("unknown provider " + provider + ": set " + name + "_BASE_URL (and " + name + "_API_KEY) to an OpenAI-compatible endpoint")
+  else if key == "" and not keyless(provider) then err("no " + name + "_API_KEY for " + spec)
+  else ok(Endpoint { kind: "chat", provider: provider, url: no_slash(url) + "/chat/completions",
+    headers: if key == "" then [] else ["Authorization: Bearer " + key], model_id: model })
+}
+
 // Where a model id goes, and as whom. Values are never printed; a missing one is named.
 effect fn endpoint(spec: String) -> Result[Endpoint, String] = {
   let (provider, model) = split_model(spec)
   if provider == "claude" or provider == "cli" then
-    if provider == "cli" and model != "claude" then err("unknown cli: " + model)
-    else ok(Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: model })
-  else if provider == "cf" or provider == "cloudflare" then {
-    let account = if env_of("CLOUDFLARE_ACCOUNT_ID")! != "" then env_of("CLOUDFLARE_ACCOUNT_ID")! else env_of("CF_ACCOUNT_ID")!
-    let token = env_of("CLOUDFLARE_API_TOKEN")!
-    let email = env_of("CLOUDFLARE_EMAIL")!
-    let key = env_of("CLOUDFLARE_API_KEY")!
-    let headers = if token != "" then ["Authorization: Bearer " + token]
-      else if email != "" and key != "" then ["X-Auth-Email: " + email, "X-Auth-Key: " + key] else []
-    if account == "" or list.is_empty(headers) then err("no Cloudflare credentials for " + spec + ": set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
-    else ok(Endpoint { kind: "chat", provider: "cf", url: "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/v1/chat/completions",
-      headers: headers, model_id: cf_id_of(model) })
-  }
-  else if provider == "anthropic" then {
-    let key = env_of("ANTHROPIC_API_KEY")!
-    let base = if env_of("ANTHROPIC_BASE_URL")! != "" then env_of("ANTHROPIC_BASE_URL")! else "https://api.anthropic.com"
-    if key == "" then err("no ANTHROPIC_API_KEY for " + spec)
-    else ok(Endpoint { kind: "anthropic", provider: "anthropic", url: (string.strip_suffix(base, "/") ?? base) + "/v1/messages",
-      headers: ["x-api-key: " + key, "anthropic-version: 2023-06-01"], model_id: model })
-  }
-  else if provider == "gemini" or provider == "google" then {
-    let key = if env_of("GEMINI_API_KEY")! != "" then env_of("GEMINI_API_KEY")! else env_of("GOOGLE_API_KEY")!
-    let base = if env_of("GEMINI_BASE_URL")! != "" then env_of("GEMINI_BASE_URL")! else "https://generativelanguage.googleapis.com/v1beta"
-    if key == "" then err("no GEMINI_API_KEY (or GOOGLE_API_KEY) for " + spec)
-    else ok(Endpoint { kind: "gemini", provider: "gemini", url: (string.strip_suffix(base, "/") ?? base) + "/models/" + model + ":streamGenerateContent?alt=sse",
-      headers: ["x-goog-api-key: " + key], model_id: model })
-  }
+    (if provider == "cli" and model != "claude" then err("unknown cli: " + model)
+    else ok(Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: model }))
+  else if provider == "cf" or provider == "cloudflare" then
+    cloudflare_endpoint(spec, model, first_env(["CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID"])!, env_of("CLOUDFLARE_API_TOKEN")!,
+      env_of("CLOUDFLARE_EMAIL")!, env_of("CLOUDFLARE_API_KEY")!)
+  else if provider == "anthropic" then anthropic_endpoint(spec, model, env_of("ANTHROPIC_API_KEY")!, env_of("ANTHROPIC_BASE_URL")!)
+  else if provider == "gemini" or provider == "google" then
+    gemini_endpoint(spec, model, first_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])!, env_of("GEMINI_BASE_URL")!)
   else {
     let name = env_name(provider)
-    let base = if env_of(name + "_BASE_URL")! != "" then env_of(name + "_BASE_URL")! else known_base(provider)
-    let key = env_of(name + "_API_KEY")!
-    if base == "" then err("unknown provider " + provider + ": set " + name + "_BASE_URL (and " + name + "_API_KEY) to an OpenAI-compatible endpoint")
-    else if key == "" and not keyless(provider) then err("no " + name + "_API_KEY for " + spec)
-    else ok(Endpoint { kind: "chat", provider: provider, url: (string.strip_suffix(base, "/") ?? base) + "/chat/completions",
-      headers: if key == "" then [] else ["Authorization: Bearer " + key], model_id: model })
+    chat_endpoint(spec, provider, model, env_of(name + "_API_KEY")!, env_of(name + "_BASE_URL")!)
   }
 }
 
@@ -325,27 +339,38 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
   let headers = fs.read_text(p.headers) ?? ""
   let ms = env.millis() - p.t0
   let _ = clean_up(p)
-  if p.kind == "claude" then {
-    match wire_claude.read(text, code, said, p.tools) {
-      ok((f, sid)) => {
-        if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () } else ()
-        ok(reply_of(f, Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
-      },
-      err(e) => err(e),
-    }
-  }
-  else if code == 28 then err(core.ErrTimeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
-  else if code == 143 or code == 137 then err(core.ErrCancelled)
-  else if code != 0 then err(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
-  else if status < 200 or status >= 300 then err(core.classify(status, text, core.retry_after_in(headers)))
-  else match fold_as(p.kind, p.schema_tool, text) {
-    // An error sent inside the stream, after a 200: read like a failed reply's body.
-    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, core.retry_after_in(headers)) else core.ErrUnreadable(e)),
-    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
-      else ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
-        p.warnings + (if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else []))),
+  if p.kind == "claude" then finish_claude(p, text, code, said, ms)
+  else match read_http(p, status, code, text, said, core.retry_after_in(headers)) {
+    ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
+      p.warnings + cut_short)),
+    err(e) => err(e),
   }
 }
+
+// claude -p's answer, and its session kept for the next call.
+effect fn finish_claude(p: Pending, text: String, code: Int, said: String, ms: Int) -> Result[Reply, core.LlmError] =
+  match wire_claude.read(text, code, said, p.tools) {
+    ok((f, sid)) => {
+      if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () } else ()
+      ok(reply_of(f, Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
+    },
+    err(e) => err(e),
+  }
+
+// What a finished curl request amounts to: curl's exit first, then the HTTP status,
+// then the stream. The answer comes with a warning when the stream ended without
+// saying why.
+fn read_http(p: Pending, status: Int, code: Int, text: String, said: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
+  if code == 28 then err(core.ErrTimeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
+  else if code == 143 or code == 137 then err(core.ErrCancelled)
+  else if code != 0 then err(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
+  else if status < 200 or status >= 300 then err(core.classify(status, text, retry_after_ms))
+  else match fold_as(p.kind, p.schema_tool, text) {
+    // An error sent inside the stream, after a 200: read like a failed reply's body.
+    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, retry_after_ms) else core.ErrUnreadable(e)),
+    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
+      else ok((f, if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else [])),
+  }
 
 // ── All at once ──
 
@@ -378,19 +403,23 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
     }
     if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) } else ()
   }
+  let started = match second { some(s) => [first, s], none => [first] }
   match winner {
     none => {
-      let _ = cancel(first)
-      match second { some(s) => { let _ = cancel(s); () }, none => () }
+      let _ = cancel_all(started)
       err(core.ErrTimeout("no complete answer within " + int.to_string(deadline / 1000) + "s"))
     },
     some(w) => {
-      let won_by_hedge = w.sh_pid != first.sh_pid
-      match (if won_by_hedge then some(first) else second) { some(loser) => { let _ = cancel(loser); () }, none => () }
+      let _ = cancel_all(list.filter(started, (p) => p.sh_pid != w.sh_pid))
       let r = finish(w)!
-      ok(Ran { reply: r, hedged: option.is_some(second), won_by_hedge: won_by_hedge })
+      ok(Ran { reply: r, hedged: option.is_some(second), won_by_hedge: w.sh_pid != first.sh_pid })
     },
   }
+}
+
+effect fn cancel_all(ps: List[Pending]) -> Unit = {
+  for p in ps { cancel(p)! }
+  ()
 }
 
 // ── Tests ──
@@ -437,6 +466,20 @@ test "a request is done only once the shell has written the exit status" {
   assert_eq(exit_of("200"), none)
   assert_eq(exit_of("200\n0\n"), some((200, 0)))
   assert_eq(exit_of("000\n28\n"), some((0, 28)))
+}
+
+test "a finished request is read: curl's exit, then the status, then the stream" {
+  let p = Pending { sh_pid: 0, pid_file: "", stream: "", cfg: "", body: "", out: "", err: "", headers: "", t0: 0, model: "", kind: "chat",
+    session: "", sent: 0, limits: limits(), tools: false, schema_tool: false, warnings: [] }
+  assert(match read_http(p, 0, 28, "", "", 0) { err(core.ErrTimeout(_)) => true, _ => false })
+  assert(match read_http(p, 0, 6, "", "Could not resolve host", 0) { err(core.ErrTransport(m)) => string.contains(m, "curl exit 6"), _ => false })
+  assert_eq(read_http(p, 429, 0, "slow down", "", 3000), err(core.ErrRateLimited(3000, "slow down")))
+  assert(match read_http(p, 200, 0, "", "", 0) { err(core.ErrTruncated(_)) => true, _ => false })
+  match read_http(p, 200, 0, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", "", 0) {
+    ok((f, cut_short)) => { assert_eq(f.content, "hi"); assert_eq(list.len(cut_short), 1) },
+    err(e) => assert_eq(core.error_text(e), ""),
+  }
+  assert(match read_http(p, 200, 0, "data: {\"error\":{\"message\":\"overloaded\"}}\n", "", 0) { err(e) => core.retryable(e), _ => false })
 }
 
 // The stop path is the one that leaks money: a request whose program outlives the shell
