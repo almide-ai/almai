@@ -33,6 +33,7 @@ import json
 import env
 import fs
 import process
+import self.core as core
 
 // ── Types ──
 
@@ -56,11 +57,11 @@ type Request = {
 
 type ToolCall = { id: String, name: String, arguments: String }
 
-// `input_tokens` excludes the cached ones. `cost_usd` is the provider's own meter when
-// it reports one (Cloudflare's neurons, OpenRouter's cost, claude's total), else the
-// price table, else 0.
-type Reply = { content: String, reasoning: String, calls: List[ToolCall], finish: String,
-  cost_usd: Float, input_tokens: Int, cached_tokens: Int, output_tokens: Int, ms: Int }
+// `finish` is normalised and `raw_finish` is the provider's own word. `usage` and `cost`
+// are almai.core's: counts the provider did not report stay unknown, and the cost says
+// where it came from. `warnings` are what this call could not honour.
+type Reply = { content: String, reasoning: String, calls: List[ToolCall], finish: core.Finish, raw_finish: String,
+  usage: core.Usage, cost: core.Cost, warnings: List[String], ms: Int }
 
 // `total_s` bounds the whole request; `idle_s` ends a stream that sends nothing that long.
 type Limits = { total_s: Int, idle_s: Int }
@@ -69,8 +70,8 @@ fn limits() -> Limits = Limits { total_s: 900, idle_s: 120 }
 
 // A request in flight. The shell appends the program's exit status to `out` when it is
 // really finished, which is what "done" means -- the stream having stopped growing does not.
-type Pending = { sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String,
-  t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool }
+type Pending = { sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String, headers: String,
+  t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, warnings: List[String] }
 
 // ── Model ids ──
 
@@ -178,11 +179,13 @@ fn body(ep: Endpoint, req: Request) -> String = {
 
 fn quoted(s: String) -> String = "\"" + string.replace(string.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
 
-fn curl_config(ep: Endpoint, body_path: String, stream_path: String, l: Limits) -> String = {
+// The response headers go to `headers_path`: Retry-After lives there.
+fn curl_config(ep: Endpoint, body_path: String, stream_path: String, headers_path: String, l: Limits) -> String = {
   var lines = ["url = " + quoted(ep.url), "request = \"POST\"", "header = \"Content-Type: application/json\""]
   for h in ep.headers { list.push(lines, "header = " + quoted(h)) }
   list.push(lines, "data = " + quoted("@" + body_path))
   list.push(lines, "output = " + quoted(stream_path))
+  list.push(lines, "dump-header = " + quoted(headers_path))
   list.push(lines, "max-time = " + int.to_string(l.total_s))
   list.push(lines, "speed-limit = 1")
   list.push(lines, "speed-time = " + int.to_string(l.idle_s))
@@ -265,21 +268,49 @@ fn fold(text: String) -> Result[Folded, String] = {
 
 let NEURON_USD = 0.011 / 1000.0
 
-fn reply_of(f: Folded, ep: Endpoint, ms: Int) -> Reply = {
-  let details: Value? = match f.usage { some(u) => match value.field(u, "prompt_tokens_details") { ok(d) => some(d), err(_) => none }, none => none }
-  let cached = if num(details, "cached_tokens") > 0 then num(details, "cached_tokens") else num(f.usage, "cached_tokens")
-  let input = int.max(0, num(f.usage, "prompt_tokens") - cached)
-  let output = num(f.usage, "completion_tokens")
-  let neurons = option.map(f.usage, (u) => json.get_float(u, "neurons") ?? float.from_int(json.get_int(u, "neurons") ?? -1)) ?? -1.0
-  let reported = option.map(f.usage, (u) => json.get_float(u, "cost") ?? -1.0) ?? -1.0
-  let cost = if neurons >= 0.0 then neurons * NEURON_USD
-    else if reported >= 0.0 then reported
-    else match price_of(ep) {
-      some(p) => (float.from_int(input) * p.input + float.from_int(cached) * p.cached + float.from_int(output) * p.output) / 1000000.0,
-      none => 0.0,
-    }
-  Reply { content: f.content, reasoning: f.reasoning, calls: list.filter(f.calls, (c) => c.name != ""), finish: f.finish,
-    cost_usd: cost, input_tokens: input, cached_tokens: cached, output_tokens: output, ms: ms }
+fn field_of(v: Value?, key: String) -> Value? = match v {
+  some(x) => match value.field(x, key) { ok(y) => some(y), err(_) => none },
+  none => none,
+}
+
+// A count, or none when the field is not there at all.
+fn opt_num(v: Value?, key: String) -> Int? = match field_of(v, key) {
+  some(_) => some(num(v, key)),
+  none => none,
+}
+
+// The chat-completions usage in almai.core's terms: prompt_tokens includes the cached
+// ones, completion_tokens the reasoning ones.
+fn usage_of(u: Value?) -> core.Usage = match u {
+  none => core.no_usage(),
+  some(_) => {
+    let details = field_of(u, "prompt_tokens_details")
+    let cached = if option.is_some(field_of(details, "cached_tokens")) then opt_num(details, "cached_tokens") else opt_num(u, "cached_tokens")
+    let prompt = opt_num(u, "prompt_tokens")
+    core.Usage { input: option.map(prompt, (n) => int.max(0, n - core.count(cached))), cache_read: cached,
+      cache_write: opt_num(u, "cache_creation_input_tokens"), output: opt_num(u, "completion_tokens"),
+      reasoning: opt_num(field_of(u, "completion_tokens_details"), "reasoning_tokens") }
+  },
+}
+
+// The provider's own meter first; then the price table; else not known.
+fn cost_of(u: Value?, usage: core.Usage, ep: Endpoint) -> core.Cost = {
+  let neurons = option.map(u, (x) => json.get_float(x, "neurons") ?? float.from_int(json.get_int(x, "neurons") ?? -1)) ?? -1.0
+  let reported = option.map(u, (x) => json.get_float(x, "cost") ?? -1.0) ?? -1.0
+  if neurons >= 0.0 then core.Cost { usd: neurons * NEURON_USD, source: "provider" }
+  else if reported >= 0.0 then core.Cost { usd: reported, source: "provider" }
+  else match price_of(ep) {
+    some(p) => core.Cost { usd: (float.from_int(core.count(usage.input)) * p.input + float.from_int(core.count(usage.cache_read)) * p.cached
+      + float.from_int(core.count(usage.output)) * p.output) / 1000000.0, source: "table" },
+    none => core.no_cost(),
+  }
+}
+
+fn reply_of(f: Folded, ep: Endpoint, ms: Int, warnings: List[String]) -> Reply = {
+  let calls = list.filter(f.calls, (c) => c.name != "")
+  let usage = usage_of(f.usage)
+  Reply { content: f.content, reasoning: f.reasoning, calls: calls, finish: core.settled_finish(f.finish, not list.is_empty(calls)), raw_finish: f.finish,
+    usage: usage, cost: cost_of(f.usage, usage, ep), warnings: warnings, ms: ms }
 }
 
 // ── claude -p ──
@@ -387,11 +418,13 @@ fn object_in(text: String) -> Value? =
 
 // claude -p --output-format json prints one object: the answer in structured_output
 // (with a schema) or in result, or is_error with what went wrong.
-fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int) -> Result[(Reply, String), String] =
+fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int, warnings: List[String]) -> Result[(Reply, String), core.LlmError] =
   match json.parse(string.trim(out)) {
-    err(_) => err(if code == 127 then "claude is not installed (no `claude` on PATH)"
-      else "claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300)),
-    ok(r) => if json.get_bool(r, "is_error") ?? false then err("claude: " + string.take(str_of(r, "result") + " " + str_of(r, "subtype"), 300))
+    err(_) => err(if code == 127 then core.Config("claude is not installed (no `claude` on PATH)")
+      else if code == 143 or code == 137 then core.Cancelled
+      else core.Unreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
+    // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
+    ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
       else {
         let text = str_of(r, "result")
         let (content, calls) = match value.field(r, "structured_output") {
@@ -405,48 +438,57 @@ fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int) -> R
               none => (text, []),
             },
         }
-        let usage: Value? = match value.field(r, "usage") { ok(u) => some(u), err(_) => none }
-        ok((Reply { content: content, reasoning: "", calls: calls, finish: if list.is_empty(calls) then "stop" else "tool_calls",
-          cost_usd: json.get_float(r, "total_cost_usd") ?? 0.0,
-          input_tokens: num(usage, "input_tokens") + num(usage, "cache_creation_input_tokens"),
-          cached_tokens: num(usage, "cache_read_input_tokens"), output_tokens: num(usage, "output_tokens"), ms: ms }, str_of(r, "session_id")))
+        let u = field_of(some(r), "usage")
+        let raw = str_of(r, "stop_reason")
+        ok((Reply { content: content, reasoning: "", calls: calls, finish: core.settled_finish(raw, not list.is_empty(calls)), raw_finish: raw,
+          usage: core.Usage { input: opt_num(u, "input_tokens"), cache_read: opt_num(u, "cache_read_input_tokens"), cache_write: opt_num(u, "cache_creation_input_tokens"),
+            output: opt_num(u, "output_tokens"), reasoning: none },
+          cost: match json.get_float(r, "total_cost_usd") { some(c) => core.Cost { usd: c, source: "provider" }, none => core.no_cost() },
+          warnings: warnings, ms: ms }, str_of(r, "session_id")))
       },
   }
 
 // ── In flight ──
 
-effect fn temp(prefix: String) -> Result[String, String] = fs.create_temp_file(prefix) |> result.map_err((e) => "temp file: " + e)
+effect fn temp(prefix: String) -> Result[String, core.LlmError] = fs.create_temp_file(prefix) |> result.map_err((e) => core.Config("temp file: " + e))
 
-effect fn start(req: Request, l: Limits) -> Result[Pending, String] = {
-  let ep = endpoint(req.model)!
+// What this request asks for that its endpoint will not do.
+fn warnings_for(ep: Endpoint, req: Request) -> List[String] =
+  if ep.kind != "claude" then []
+  else (if req.effort != "" then ["claude -p takes no reasoning effort; \"" + req.effort + "\" was not sent"] else [])
+    + (if option.is_some(req.schema) and not list.is_empty(req.tools) then ["with tools, claude -p answers as JSON text; the schema was not sent"] else [])
+
+effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
+  let ep = endpoint(req.model) |> result.map_err((e) => core.Config(e))!
   let stream_path = temp("almai-stream")!
   let cfg_path = temp("almai-cfg")!
   let body_path = temp("almai-body")!
   let out_path = temp("almai-out")!
   let err_path = temp("almai-err")!
   let pid_path = temp("almai-pid")!
+  let headers_path = temp("almai-headers")!
   // The program runs in the background so its own pid is known: killing the shell alone
   // would leave the request running, still streaming and still billed.
   let tail = " & p=$!; echo $p > " + sh_quote(pid_path) + "; wait $p; "
   let script = if ep.kind == "claude" then {
     let session = if req.session == "" then none else continuing(session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
     let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
-    fs.write(body_path, claude_prompt(req.messages, from, resume == "")) |> result.map_err((e) => "write request: " + e)!
-    fs.write(cfg_path, claude_system(req.messages, req.tools)) |> result.map_err((e) => "write request: " + e)!
+    fs.write(body_path, claude_prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.Config("write request: " + e))!
+    fs.write(cfg_path, claude_system(req.messages, req.tools)) |> result.map_err((e) => core.Config("write request: " + e))!
     // From the temp directory, so no project file of the person's is read as memory and
     // the sessions are filed apart from theirs.
-    "cd \"$" + "{TMPDIR:-/tmp}\" && (" + claude_command(ep.model_id, resume, cfg_path, req.schema, req.session != "") + ") < " + sh_quote(body_path)
+    "cd \"$" + "{TMPDIR:-/tmp}\" && (" + claude_command(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != "") + ") < " + sh_quote(body_path)
       + " > " + sh_quote(stream_path) + " 2> " + sh_quote(err_path) + tail + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
   } else {
-    fs.write(body_path, body(ep, req)) |> result.map_err((e) => "write request: " + e)!
-    fs.write(cfg_path, curl_config(ep, body_path, stream_path, l)) |> result.map_err((e) => "write request: " + e)!
+    fs.write(body_path, body(ep, req)) |> result.map_err((e) => core.Config("write request: " + e))!
+    fs.write(cfg_path, curl_config(ep, body_path, stream_path, headers_path, l)) |> result.map_err((e) => core.Config("write request: " + e))!
     "curl --config " + sh_quote(cfg_path) + " > " + sh_quote(out_path) + " 2> " + sh_quote(err_path)
       + tail + "printf '\\n%s\\n' \"$?\" >> " + sh_quote(out_path)
   }
-  let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => "transport: spawn: " + e)!
-  ok(Pending { sh_pid: pid, pid_file: pid_path, stream: stream_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path,
+  let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.Transport("spawn: " + e))!
+  ok(Pending { sh_pid: pid, pid_file: pid_path, stream: stream_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, headers: headers_path,
     t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
-    tools: not list.is_empty(req.tools) })
+    tools: not list.is_empty(req.tools), warnings: warnings_for(ep, req) })
 }
 
 // `out` is the HTTP status with no newline, then the exit status on its own line.
@@ -480,6 +522,7 @@ effect fn clean_up(p: Pending) -> Unit = {
   let _ = fs.remove(p.out)
   let _ = fs.remove(p.err)
   let _ = fs.remove(p.pid_file)
+  let _ = fs.remove(p.headers)
   ()
 }
 
@@ -493,16 +536,20 @@ effect fn cancel(p: Pending) -> Unit = {
   clean_up(p)!
 }
 
-// What the finished request amounts to. Call once `is_done` says so. Error messages
-// keep shapes a caller can classify: `status NNN: ...`, `transport: ...`, `request timeout: ...`.
-effect fn finish(p: Pending) -> Result[Reply, String] = {
+// What the finished request amounts to. Call once `is_done` says so. A failure is an
+// almai.core.LlmError; `core.error_text` words it in the shapes callers matched before:
+// `status NNN: ...`, `transport: ...`, `request timeout: ...`.
+// (No `!` on the Unit and Bool effect calls in the functions that fail with a
+// core.LlmError: almide#2635, `!` there passes check and fails in rustc.)
+effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
   let (status, code) = exit_of(fs.read_text(p.out) ?? "") ?? (0, 0)
   let text = fs.read_text(p.stream) ?? ""
   let said = string.trim(fs.read_text(p.err) ?? "")
+  let headers = fs.read_text(p.headers) ?? ""
   let ms = env.millis() - p.t0
-  clean_up(p)!
+  let _ = clean_up(p)
   if p.kind == "claude" then {
-    match claude_reply(text, code, said, p.tools, ms) {
+    match claude_reply(text, code, said, p.tools, ms, p.warnings) {
       ok((r, sid)) => {
         if p.session != "" and sid != "" then { let _ = fs.write(p.session, session_text(ClaudeSession { id: sid, sent: p.sent, model: p.model })); () } else ()
         ok(r)
@@ -510,19 +557,18 @@ effect fn finish(p: Pending) -> Result[Reply, String] = {
       err(e) => err(e),
     }
   }
-  else if code == 28 then err("request timeout: no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s")
-  else if code != 0 then err("transport: curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300)))
-  else if status < 200 or status >= 300 then err("status " + int.to_string(status) + ": " + string.take(string.trim(text), 500))
+  else if code == 28 then err(core.Timeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
+  else if code == 143 or code == 137 then err(core.Cancelled)
+  else if code != 0 then err(core.Transport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
+  else if status < 200 or status >= 300 then err(core.classify(status, text, core.retry_after_in(headers)))
   else match fold(text) {
-    err(e) => err(e),
-    ok(f) => ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms)),
+    // An error sent inside the stream, after a 200: read like a failed reply's body.
+    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, core.retry_after_in(headers)) else core.Unreadable(e)),
+    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.Truncated("the stream ended with no answer and no finish reason"))
+      else ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
+        p.warnings + (if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else []))),
   }
 }
-
-// Worth trying again: a rate limit, a server error, the network, a stream that stalled.
-fn is_transient(e: String) -> Bool =
-  string.contains(e, "status 429") or string.contains(e, "status 50") or string.starts_with(e, "transport")
-    or string.starts_with(e, "request timeout")
 
 // ── All at once ──
 
@@ -537,7 +583,7 @@ let POLL_MS = 250
 // first answer to land is used; claude -p is never hedged, a second copy only spends the
 // same login's rate limit twice. Past `cap_ms` (0: only `limits`) both are stopped: a
 // model that keeps talking is never idle, so `idle_s` cannot catch it.
-effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran, String] = {
+effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran, core.LlmError] = {
   let t0 = env.millis()
   let hard = (l.total_s + 30) * 1000
   let deadline = if cap_ms > 0 then int.min(cap_ms, hard) else hard
@@ -548,22 +594,22 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
   var timed_out = false
   while option.is_none(winner) and not timed_out {
     let waited = env.millis() - t0
-    if is_done(first)! then { winner = some(first) }
+    if is_done(first) ?? false then { winner = some(first) }
     else match second {
-      some(s) => if is_done(s)! then { winner = some(s) } else (),
+      some(s) => if is_done(s) ?? false then { winner = some(s) } else (),
       none => if hedge_at > 0 and waited > hedge_at then { second = some(start(req, l)!) } else (),
     }
     if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) } else ()
   }
   match winner {
     none => {
-      cancel(first)!
-      match second { some(s) => cancel(s)!, none => () }
-      err("request timeout: no complete answer within " + int.to_string(deadline / 1000) + "s")
+      let _ = cancel(first)
+      match second { some(s) => { let _ = cancel(s); () }, none => () }
+      err(core.Timeout("no complete answer within " + int.to_string(deadline / 1000) + "s"))
     },
     some(w) => {
       let won_by_hedge = w.sh_pid != first.sh_pid
-      match (if won_by_hedge then some(first) else second) { some(loser) => cancel(loser)!, none => () }
+      match (if won_by_hedge then some(first) else second) { some(loser) => { let _ = cancel(loser); () }, none => () }
       let r = finish(w)!
       ok(Ran { reply: r, hedged: option.is_some(second), won_by_hedge: won_by_hedge })
     },
@@ -607,9 +653,11 @@ test "tool calls are put back together from their pieces" {
   let f = fold(sse) ?? Folded { content: "", reasoning: "", calls: [], finish: "", usage: none }
   assert_eq(f.content, "Let me look.")
   assert_eq(f.calls, [ToolCall { id: "c1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
-  let r = reply_of(f, Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10)
-  assert_eq((r.input_tokens, r.cached_tokens, r.output_tokens), (60, 40, 20))
-  assert(r.cost_usd > 0.0)
+  let r = reply_of(f, Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
+  assert_eq((r.usage.input, r.usage.cache_read, r.usage.output, r.usage.cache_write), (some(60), some(40), some(20), none))
+  assert_eq(r.finish, core.ToolCalls)
+  assert_eq(r.raw_finish, "tool_calls")
+  assert(r.cost.usd > 0.0 and r.cost.source == "table")
   assert(result.is_err(fold("data: {\"error\":{\"message\":\"rate limited\"}}\n")))
 }
 
@@ -640,21 +688,25 @@ test "claude gets the conversation once, then only what is new" {
 test "claude's answer: the JSON in its text with tools, structured_output with a schema, plain words otherwise" {
   let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.str("s1")),
     ("result", value.str(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
-  match claude_reply(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true, 5) {
-    ok((r, sid)) => { assert_eq(r.calls, [ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq(r.input_tokens, 1002) },
-    err(e) => assert_eq(e, ""),
+  match claude_reply(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true, 5, []) {
+    ok((r, sid)) => { assert_eq(r.calls, [ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(r.finish, core.ToolCalls) },
+    err(e) => assert_eq(core.error_text(e), ""),
   }
-  match claude_reply(wrap("All tests pass."), 0, "", true, 5) {
+  match claude_reply(wrap("All tests pass."), 0, "", true, 5, []) {
     ok((r, _)) => { assert_eq(r.content, "All tests pass."); assert(list.is_empty(r.calls)) },
-    err(e) => assert_eq(e, ""),
+    err(e) => assert_eq(core.error_text(e), ""),
   }
   let structured = "{\"is_error\":false,\"structured_output\":{\"edits\":[]},\"result\":\"\"}"
-  match claude_reply(structured, 0, "", false, 5) {
+  match claude_reply(structured, 0, "", false, 5, []) {
     ok((r, _)) => assert_eq(r.content, "{\"edits\":[]}"),
-    err(e) => assert_eq(e, ""),
+    err(e) => assert_eq(core.error_text(e), ""),
   }
-  assert(result.is_err(claude_reply("{\"is_error\":true,\"result\":\"Not logged in\"}", 1, "", true, 5)))
-  assert(result.is_err(claude_reply("", 127, "sh: claude: not found", true, 5)))
+  assert(result.is_err(claude_reply("{\"is_error\":true,\"result\":\"Not logged in\"}", 1, "", true, 5, [])))
+  assert_eq(claude_reply("", 127, "sh: claude: not found", true, 5, []), err(core.Config("claude is not installed (no `claude` on PATH)")))
+  match claude_reply("{\"is_error\":true,\"result\":\"API Error: 529 {\\\"type\\\":\\\"overloaded_error\\\"}\"}", 1, "", true, 5, []) {
+    err(e) => assert(core.retryable(e)),
+    ok(_) => assert(false),
+  }
 }
 
 // The stop path is the one that leaks money: a request whose program outlives the shell
@@ -673,7 +725,7 @@ test "cancel stops the work the request spawned, not only its shell" {
   // next append, which would hide the very thing measured.
   let scratch = fs.create_temp_file("almai-test-scratch")!
   cancel(Pending { sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
-    t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: limits(), tools: false })!
+    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: limits(), tools: false, warnings: [] })!
   env.sleep_ms(400)
   let just_after = string.len(fs.read_text(sink) ?? "")
   env.sleep_ms(400)

@@ -7,7 +7,7 @@ Multi-provider LLM client for [Almide](https://github.com/almide/almide). One in
 ```toml
 # almide.toml
 [dependencies]
-almai = { git = "https://github.com/almide-ai/almai", tag = "v0.2.0" }
+almai = { git = "https://github.com/almide-ai/almai", tag = "v0.3.0" }
 ```
 
 ## Quick start
@@ -170,7 +170,7 @@ while not live.is_done(p)! {
   show(live.text_so_far(p)!)                       // what has arrived so far
   if esc_pressed() then live.cancel(p)! else env.sleep_ms(250)
 }
-let r = live.finish(p)!                            // content, reasoning, calls, tokens, cost
+let r = live.finish(p)!                            // content, reasoning, calls, finish, usage, cost, warnings
 
 // Or all at once, with a second copy after 120 s and a 6-minute cap:
 let ran = live.run(req, live.limits(), 120000, 360000)!
@@ -202,8 +202,21 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
   not through `--json-schema`: holding the schema as a tool, Claude tried to call the
   listed tools as its own and gave up. With `session` set to a file, the session is
   continued with `--resume`, so each call sends only the new messages.
-- Errors keep shapes a caller can classify: `status NNN: …`, `transport: …`,
-  `request timeout: …`; `live.is_transient` says which are worth retrying.
+- Failures are `almai.core.LlmError`: `RateLimited(retry_after_ms, …)`, `Overloaded`,
+  `Timeout`, `Transport`, `ContextTooLong`, `ContentFiltered`, `Auth`, `NotFound`,
+  `BadRequest`, `Cancelled`, `Truncated`, … One `core.classify` reads a failed reply,
+  body first (a context overflow comes as a 400); `core.retryable(e)` says whether to
+  try again as is and `core.wants_fallback(e)` whether to try another model; Retry-After
+  is read from the response headers. `core.error_text(e)` words it as before:
+  `status NNN: …`, `transport: …`, `request timeout: …`.
+- `finish` is `Stop | Length | ToolCalls | ContentFilter | OtherFinish(raw)`, from one
+  table of every provider's word, with `raw_finish` kept. `usage` splits uncached input,
+  cache read, cache write, output and reasoning; a count the provider did not report is
+  `none`, not 0. `cost` says where it came from: `"provider"`, `"table"` or `"none"`.
+  `warnings` lists what the call could not honour (claude -p and a reasoning effort, say).
+- Hedging stays in `live.run`'s loop. Almide's `fan.any` takes the first Ok in source
+  order and waits for the earlier arms, so it suits a fallback chain run in parallel
+  (it stops the later arms once an earlier one wins), not a first-to-finish race.
 
 ## Conversation builder
 

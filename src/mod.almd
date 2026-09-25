@@ -225,7 +225,11 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
 // request, etc.) propagate immediately. Pass `max_attempts: 1` for no retry.
 
 fn is_retriable_error(msg: String) -> Bool =
+  string.contains(msg, "408") or
+  string.contains(msg, "409") or
   string.contains(msg, "429") or
+  string.contains(msg, "529") or
+  string.contains(msg, "overloaded") or
   string.contains(msg, "500") or
   string.contains(msg, "502") or
   string.contains(msg, "503") or
@@ -375,4 +379,10 @@ test "parse_content_as_json" {
     ok(v) => assert_eq(json.get_int(v, "x") |> option.unwrap_or(0), 1)
     err(_) => assert(false)
   }
+}
+
+test "is_retriable_error true for 408, 409, 529 and an overloaded provider" {
+  assert(is_retriable_error("HTTP 408: request timeout"))
+  assert(is_retriable_error("HTTP 409: conflict"))
+  assert(is_retriable_error("HTTP 529: {\"type\":\"overloaded_error\"}"))
 }
