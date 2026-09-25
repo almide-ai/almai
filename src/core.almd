@@ -16,30 +16,33 @@
 
 // ── How a call ended ──
 
-type Finish = | Stop | Length | ToolCalls | ContentFilter | OtherFinish(String)
+// The cases carry the type's name: an Almide case name is seen by every module in the
+// program, even ones that never import this (almide#2636), so a bare `Stop` here broke
+// golemide's own `type Stop`.
+type Finish = | FinishStop | FinishLength | FinishToolCalls | FinishFiltered | FinishOther(String)
 
 // Every provider's word for it, in one table. A stop that came with tool calls is read
 // by the caller as ToolCalls (see `settled_finish`).
 fn finish_of(raw: String) -> Finish = {
   let r = string.to_lower(string.trim(raw))
-  if r == "stop" or r == "end_turn" or r == "stop_sequence" or r == "eos" or r == "complete" or r == "finish_reason_stop" or r == "" then Stop
-  else if r == "length" or r == "max_tokens" or r == "max_output_tokens" or r == "model_length" or r == "model_context_window_exceeded" then Length
-  else if r == "tool_calls" or r == "tool_use" or r == "function_call" or r == "tool_call" then ToolCalls
-  else if r == "content_filter" or r == "safety" or r == "recitation" or r == "refusal" or r == "blocklist" or r == "prohibited_content" or r == "spii" or r == "guardrail_intervened" then ContentFilter
-  else OtherFinish(raw)
+  if r == "stop" or r == "end_turn" or r == "stop_sequence" or r == "eos" or r == "complete" or r == "finish_reason_stop" or r == "" then FinishStop
+  else if r == "length" or r == "max_tokens" or r == "max_output_tokens" or r == "model_length" or r == "model_context_window_exceeded" then FinishLength
+  else if r == "tool_calls" or r == "tool_use" or r == "function_call" or r == "tool_call" then FinishToolCalls
+  else if r == "content_filter" or r == "safety" or r == "recitation" or r == "refusal" or r == "blocklist" or r == "prohibited_content" or r == "spii" or r == "guardrail_intervened" then FinishFiltered
+  else FinishOther(raw)
 }
 
 fn settled_finish(raw: String, has_calls: Bool) -> Finish = match finish_of(raw) {
-  Stop => if has_calls then ToolCalls else Stop,
+  FinishStop => if has_calls then FinishToolCalls else FinishStop,
   f => f,
 }
 
 fn finish_name(f: Finish) -> String = match f {
-  Stop => "stop",
-  Length => "length",
-  ToolCalls => "tool_calls",
-  ContentFilter => "content_filter",
-  OtherFinish(raw) => raw,
+  FinishStop => "stop",
+  FinishLength => "length",
+  FinishToolCalls => "tool_calls",
+  FinishFiltered => "content_filter",
+  FinishOther(raw) => raw,
 }
 
 // ── What it used, and what it cost ──
@@ -77,36 +80,36 @@ fn add_cost(a: Cost, b: Cost) -> Cost =
 // ── What went wrong ──
 
 type LlmError =
-  | Config(String)            // no key, unknown provider: nothing was sent
-  | RateLimited(Int, String)  // retry after this many ms (0: not said), and what the provider said
-  | Overloaded(Int, String)   // 5xx, 529, "overloaded": the provider, not the request
-  | Timeout(String)           // no answer in time, or a stream that went quiet
-  | Transport(String)         // the network: DNS, refused, reset
-  | ContextTooLong(String)    // the request is bigger than the model takes
-  | ContentFiltered(String)   // refused on policy
-  | Auth(Int, String)         // 401 / 403
-  | NotFound(Int, String)     // 404: usually the model id
-  | BadRequest(Int, String)   // 400 / 422 and the like: the request itself
-  | Cancelled
-  | Truncated(String)         // the answer stopped before its end
-  | Unreadable(String)        // a reply that could not be read
-  | Other(Int, String)
+  | ErrConfig(String)            // no key, unknown provider: nothing was sent
+  | ErrRateLimited(Int, String)  // retry after this many ms (0: not said), and what the provider said
+  | ErrOverloaded(Int, String)   // 5xx, 529, "overloaded": the provider, not the request
+  | ErrTimeout(String)           // no answer in time, or a stream that went quiet
+  | ErrTransport(String)         // the network: DNS, refused, reset
+  | ErrContextTooLong(String)    // the request is bigger than the model takes
+  | ErrContentFiltered(String)   // refused on policy
+  | ErrAuth(Int, String)         // 401 / 403
+  | ErrNotFound(Int, String)     // 404: usually the model id
+  | ErrBadRequest(Int, String)   // 400 / 422 and the like: the request itself
+  | ErrCancelled
+  | ErrTruncated(String)         // the answer stopped before its end
+  | ErrUnreadable(String)        // a reply that could not be read
+  | ErrOther(Int, String)
 
 // Worth trying the same request again, as it is.
 fn retryable(e: LlmError) -> Bool = match e {
-  RateLimited(_, _) => true,
-  Overloaded(_, _) => true,
-  Timeout(_) => true,
-  Transport(_) => true,
-  Other(status, _) => status == 408 or status == 409 or status == 425,
+  ErrRateLimited(_, _) => true,
+  ErrOverloaded(_, _) => true,
+  ErrTimeout(_) => true,
+  ErrTransport(_) => true,
+  ErrOther(status, _) => status == 408 or status == 409 or status == 425,
   _ => false,
 }
 
 // Not worth retrying here, but worth another model: a bigger context, another family.
 fn wants_fallback(e: LlmError) -> Bool = match e {
-  ContextTooLong(_) => true,
-  ContentFiltered(_) => true,
-  NotFound(_, _) => true,
+  ErrContextTooLong(_) => true,
+  ErrContentFiltered(_) => true,
+  ErrNotFound(_, _) => true,
   _ => retryable(e),
 }
 
@@ -119,36 +122,36 @@ fn has_any(body: String, needles: List[String]) -> Bool = {
 // providers put a context overflow under 400, and a rate limit under 400 or 503.
 fn classify(status: Int, body: String, retry_after_ms: Int) -> LlmError = {
   let said = string.take(string.trim(body), 500)
-  if has_any(body, ["context_length_exceeded", "context window", "maximum context length", "prompt is too long", "too many tokens", "input is too long", "exceeds the context", "reduce the length"]) then ContextTooLong(said)
-  else if has_any(body, ["content_filter", "content policy", "content_policy", "safety system", "responsibleaipolicyviolation", "flagged"]) then ContentFiltered(said)
-  else if status == 429 or has_any(body, ["rate limit", "rate_limit", "too many requests", "quota exceeded", "capacity exceeded"]) then RateLimited(retry_after_ms, said)
-  else if status == 529 or has_any(body, ["overloaded", "server is busy", "service unavailable"]) then Overloaded(status, said)
-  else if status == 401 or status == 403 then Auth(status, said)
+  if has_any(body, ["context_length_exceeded", "context window", "maximum context length", "prompt is too long", "too many tokens", "input is too long", "exceeds the context", "reduce the length"]) then ErrContextTooLong(said)
+  else if has_any(body, ["content_filter", "content policy", "content_policy", "safety system", "responsibleaipolicyviolation", "flagged"]) then ErrContentFiltered(said)
+  else if status == 429 or has_any(body, ["rate limit", "rate_limit", "too many requests", "quota exceeded", "capacity exceeded"]) then ErrRateLimited(retry_after_ms, said)
+  else if status == 529 or has_any(body, ["overloaded", "server is busy", "service unavailable"]) then ErrOverloaded(status, said)
+  else if status == 401 or status == 403 then ErrAuth(status, said)
   // Cloudflare answers an unknown model with 400 and "No such model".
-  else if status == 404 or has_any(body, ["no such model", "model not found", "model_not_found", "does not exist or you do not have access"]) then NotFound(status, said)
-  else if status == 408 or status == 504 then Timeout("status " + int.to_string(status) + ": " + said)
-  else if status >= 500 then Overloaded(status, said)
-  else if status == 400 or status == 422 or status == 413 then BadRequest(status, said)
-  else Other(status, said)
+  else if status == 404 or has_any(body, ["no such model", "model not found", "model_not_found", "does not exist or you do not have access"]) then ErrNotFound(status, said)
+  else if status == 408 or status == 504 then ErrTimeout("status " + int.to_string(status) + ": " + said)
+  else if status >= 500 then ErrOverloaded(status, said)
+  else if status == 400 or status == 422 or status == 413 then ErrBadRequest(status, said)
+  else ErrOther(status, said)
 }
 
 // The error as text, in the shapes callers already match on: "status NNN: ...",
 // "transport: ...", "request timeout: ...".
 fn error_text(e: LlmError) -> String = match e {
-  Config(m) => m,
-  RateLimited(ms, said) => "status 429: " + said + (if ms > 0 then " (retry after " + int.to_string(ms) + "ms)" else ""),
-  Overloaded(status, said) => "status " + int.to_string(status) + ": " + said,
-  Timeout(m) => "request timeout: " + m,
-  Transport(m) => "transport: " + m,
-  ContextTooLong(said) => "context too long: " + said,
-  ContentFiltered(said) => "content filtered: " + said,
-  Auth(status, said) => "status " + int.to_string(status) + ": " + said,
-  NotFound(status, said) => "status " + int.to_string(status) + ": " + said,
-  BadRequest(status, said) => "status " + int.to_string(status) + ": " + said,
-  Cancelled => "cancelled",
-  Truncated(m) => "truncated: " + m,
-  Unreadable(m) => "unreadable answer: " + m,
-  Other(status, said) => "status " + int.to_string(status) + ": " + said,
+  ErrConfig(m) => m,
+  ErrRateLimited(ms, said) => "status 429: " + said + (if ms > 0 then " (retry after " + int.to_string(ms) + "ms)" else ""),
+  ErrOverloaded(status, said) => "status " + int.to_string(status) + ": " + said,
+  ErrTimeout(m) => "request timeout: " + m,
+  ErrTransport(m) => "transport: " + m,
+  ErrContextTooLong(said) => "context too long: " + said,
+  ErrContentFiltered(said) => "content filtered: " + said,
+  ErrAuth(status, said) => "status " + int.to_string(status) + ": " + said,
+  ErrNotFound(status, said) => "status " + int.to_string(status) + ": " + said,
+  ErrBadRequest(status, said) => "status " + int.to_string(status) + ": " + said,
+  ErrCancelled => "cancelled",
+  ErrTruncated(m) => "truncated: " + m,
+  ErrUnreadable(m) => "unreadable answer: " + m,
+  ErrOther(status, said) => "status " + int.to_string(status) + ": " + said,
 }
 
 // Retry-After, as seconds or an HTTP date; the date form is read as "not said".
@@ -175,13 +178,13 @@ fn retry_after_in(headers: String) -> Int = {
 }
 
 test "every provider's finish word lands on one of five" {
-  assert_eq(finish_of("end_turn"), Stop)
-  assert_eq(finish_of("MAX_TOKENS"), Length)
-  assert_eq(finish_of("tool_use"), ToolCalls)
-  assert_eq(finish_of("SAFETY"), ContentFilter)
-  assert_eq(finish_of("pause_turn"), OtherFinish("pause_turn"))
-  assert_eq(settled_finish("stop", true), ToolCalls)
-  assert_eq(finish_name(OtherFinish("pause_turn")), "pause_turn")
+  assert_eq(finish_of("end_turn"), FinishStop)
+  assert_eq(finish_of("MAX_TOKENS"), FinishLength)
+  assert_eq(finish_of("tool_use"), FinishToolCalls)
+  assert_eq(finish_of("SAFETY"), FinishFiltered)
+  assert_eq(finish_of("pause_turn"), FinishOther("pause_turn"))
+  assert_eq(settled_finish("stop", true), FinishToolCalls)
+  assert_eq(finish_name(FinishOther("pause_turn")), "pause_turn")
 }
 
 test "usage adds up, and what was never reported stays unknown" {
@@ -194,18 +197,18 @@ test "usage adds up, and what was never reported stays unknown" {
 }
 
 test "a failed reply is classified by its body first, then its status" {
-  assert_eq(classify(400, "{\"error\":{\"code\":\"context_length_exceeded\"}}", 0), ContextTooLong("{\"error\":{\"code\":\"context_length_exceeded\"}}"))
-  assert_eq(classify(429, "slow down", 2000), RateLimited(2000, "slow down"))
-  assert_eq(classify(503, "rate limit reached", 0), RateLimited(0, "rate limit reached"))
-  assert_eq(classify(529, "{\"type\":\"overloaded_error\"}", 0), Overloaded(529, "{\"type\":\"overloaded_error\"}"))
-  assert_eq(classify(401, "bad key", 0), Auth(401, "bad key"))
+  assert_eq(classify(400, "{\"error\":{\"code\":\"context_length_exceeded\"}}", 0), ErrContextTooLong("{\"error\":{\"code\":\"context_length_exceeded\"}}"))
+  assert_eq(classify(429, "slow down", 2000), ErrRateLimited(2000, "slow down"))
+  assert_eq(classify(503, "rate limit reached", 0), ErrRateLimited(0, "rate limit reached"))
+  assert_eq(classify(529, "{\"type\":\"overloaded_error\"}", 0), ErrOverloaded(529, "{\"type\":\"overloaded_error\"}"))
+  assert_eq(classify(401, "bad key", 0), ErrAuth(401, "bad key"))
   assert(retryable(classify(502, "bad gateway", 0)))
   assert(retryable(classify(409, "conflict", 0)))
   assert(not retryable(classify(400, "invalid json", 0)))
-  assert_eq(classify(400, "AiError: No such model @cf/x", 0), NotFound(400, "AiError: No such model @cf/x"))
-  assert(not retryable(ContextTooLong("x")) and wants_fallback(ContextTooLong("x")))
+  assert_eq(classify(400, "AiError: No such model @cf/x", 0), ErrNotFound(400, "AiError: No such model @cf/x"))
+  assert(not retryable(ErrContextTooLong("x")) and wants_fallback(ErrContextTooLong("x")))
   assert_eq(error_text(classify(429, "slow down", 0)), "status 429: slow down")
-  assert_eq(error_text(Transport("curl exit 6")), "transport: curl exit 6")
+  assert_eq(error_text(ErrTransport("curl exit 6")), "transport: curl exit 6")
 }
 
 test "Retry-After is read in milliseconds, or seconds, and a date is not said" {

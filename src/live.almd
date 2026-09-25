@@ -420,9 +420,9 @@ fn object_in(text: String) -> Value? =
 // (with a schema) or in result, or is_error with what went wrong.
 fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int, warnings: List[String]) -> Result[(Reply, String), core.LlmError] =
   match json.parse(string.trim(out)) {
-    err(_) => err(if code == 127 then core.Config("claude is not installed (no `claude` on PATH)")
-      else if code == 143 or code == 137 then core.Cancelled
-      else core.Unreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
+    err(_) => err(if code == 127 then core.ErrConfig("claude is not installed (no `claude` on PATH)")
+      else if code == 143 or code == 137 then core.ErrCancelled
+      else core.ErrUnreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
     // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
     ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
       else {
@@ -450,7 +450,7 @@ fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int, warn
 
 // ── In flight ──
 
-effect fn temp(prefix: String) -> Result[String, core.LlmError] = fs.create_temp_file(prefix) |> result.map_err((e) => core.Config("temp file: " + e))
+effect fn temp(prefix: String) -> Result[String, core.LlmError] = fs.create_temp_file(prefix) |> result.map_err((e) => core.ErrConfig("temp file: " + e))
 
 // What this request asks for that its endpoint will not do.
 fn warnings_for(ep: Endpoint, req: Request) -> List[String] =
@@ -459,7 +459,7 @@ fn warnings_for(ep: Endpoint, req: Request) -> List[String] =
     + (if option.is_some(req.schema) and not list.is_empty(req.tools) then ["with tools, claude -p answers as JSON text; the schema was not sent"] else [])
 
 effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
-  let ep = endpoint(req.model) |> result.map_err((e) => core.Config(e))!
+  let ep = endpoint(req.model) |> result.map_err((e) => core.ErrConfig(e))!
   let stream_path = temp("almai-stream")!
   let cfg_path = temp("almai-cfg")!
   let body_path = temp("almai-body")!
@@ -473,19 +473,19 @@ effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   let script = if ep.kind == "claude" then {
     let session = if req.session == "" then none else continuing(session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
     let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
-    fs.write(body_path, claude_prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.Config("write request: " + e))!
-    fs.write(cfg_path, claude_system(req.messages, req.tools)) |> result.map_err((e) => core.Config("write request: " + e))!
+    fs.write(body_path, claude_prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+    fs.write(cfg_path, claude_system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
     // From the temp directory, so no project file of the person's is read as memory and
     // the sessions are filed apart from theirs.
     "cd \"$" + "{TMPDIR:-/tmp}\" && (" + claude_command(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != "") + ") < " + sh_quote(body_path)
       + " > " + sh_quote(stream_path) + " 2> " + sh_quote(err_path) + tail + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
   } else {
-    fs.write(body_path, body(ep, req)) |> result.map_err((e) => core.Config("write request: " + e))!
-    fs.write(cfg_path, curl_config(ep, body_path, stream_path, headers_path, l)) |> result.map_err((e) => core.Config("write request: " + e))!
+    fs.write(body_path, body(ep, req)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+    fs.write(cfg_path, curl_config(ep, body_path, stream_path, headers_path, l)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
     "curl --config " + sh_quote(cfg_path) + " > " + sh_quote(out_path) + " 2> " + sh_quote(err_path)
       + tail + "printf '\\n%s\\n' \"$?\" >> " + sh_quote(out_path)
   }
-  let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.Transport("spawn: " + e))!
+  let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.ErrTransport("spawn: " + e))!
   ok(Pending { sh_pid: pid, pid_file: pid_path, stream: stream_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, headers: headers_path,
     t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
     tools: not list.is_empty(req.tools), warnings: warnings_for(ep, req) })
@@ -557,14 +557,14 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
       err(e) => err(e),
     }
   }
-  else if code == 28 then err(core.Timeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
-  else if code == 143 or code == 137 then err(core.Cancelled)
-  else if code != 0 then err(core.Transport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
+  else if code == 28 then err(core.ErrTimeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
+  else if code == 143 or code == 137 then err(core.ErrCancelled)
+  else if code != 0 then err(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
   else if status < 200 or status >= 300 then err(core.classify(status, text, core.retry_after_in(headers)))
   else match fold(text) {
     // An error sent inside the stream, after a 200: read like a failed reply's body.
-    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, core.retry_after_in(headers)) else core.Unreadable(e)),
-    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.Truncated("the stream ended with no answer and no finish reason"))
+    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, core.retry_after_in(headers)) else core.ErrUnreadable(e)),
+    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
       else ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
         p.warnings + (if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else []))),
   }
@@ -605,7 +605,7 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
     none => {
       let _ = cancel(first)
       match second { some(s) => { let _ = cancel(s); () }, none => () }
-      err(core.Timeout("no complete answer within " + int.to_string(deadline / 1000) + "s"))
+      err(core.ErrTimeout("no complete answer within " + int.to_string(deadline / 1000) + "s"))
     },
     some(w) => {
       let won_by_hedge = w.sh_pid != first.sh_pid
@@ -655,7 +655,7 @@ test "tool calls are put back together from their pieces" {
   assert_eq(f.calls, [ToolCall { id: "c1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
   let r = reply_of(f, Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
   assert_eq((r.usage.input, r.usage.cache_read, r.usage.output, r.usage.cache_write), (some(60), some(40), some(20), none))
-  assert_eq(r.finish, core.ToolCalls)
+  assert_eq(r.finish, core.FinishToolCalls)
   assert_eq(r.raw_finish, "tool_calls")
   assert(r.cost.usd > 0.0 and r.cost.source == "table")
   assert(result.is_err(fold("data: {\"error\":{\"message\":\"rate limited\"}}\n")))
@@ -689,7 +689,7 @@ test "claude's answer: the JSON in its text with tools, structured_output with a
   let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.str("s1")),
     ("result", value.str(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
   match claude_reply(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true, 5, []) {
-    ok((r, sid)) => { assert_eq(r.calls, [ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(r.finish, core.ToolCalls) },
+    ok((r, sid)) => { assert_eq(r.calls, [ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(r.finish, core.FinishToolCalls) },
     err(e) => assert_eq(core.error_text(e), ""),
   }
   match claude_reply(wrap("All tests pass."), 0, "", true, 5, []) {
@@ -702,7 +702,7 @@ test "claude's answer: the JSON in its text with tools, structured_output with a
     err(e) => assert_eq(core.error_text(e), ""),
   }
   assert(result.is_err(claude_reply("{\"is_error\":true,\"result\":\"Not logged in\"}", 1, "", true, 5, [])))
-  assert_eq(claude_reply("", 127, "sh: claude: not found", true, 5, []), err(core.Config("claude is not installed (no `claude` on PATH)")))
+  assert_eq(claude_reply("", 127, "sh: claude: not found", true, 5, []), err(core.ErrConfig("claude is not installed (no `claude` on PATH)")))
   match claude_reply("{\"is_error\":true,\"result\":\"API Error: 529 {\\\"type\\\":\\\"overloaded_error\\\"}\"}", 1, "", true, 5, []) {
     err(e) => assert(core.retryable(e)),
     ok(_) => assert(false),

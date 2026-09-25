@@ -7,7 +7,7 @@ Multi-provider LLM client for [Almide](https://github.com/almide/almide). One in
 ```toml
 # almide.toml
 [dependencies]
-almai = { git = "https://github.com/almide-ai/almai", tag = "v0.3.0" }
+almai = { git = "https://github.com/almide-ai/almai", tag = "v0.3.1" }
 ```
 
 ## Quick start
@@ -202,14 +202,16 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
   not through `--json-schema`: holding the schema as a tool, Claude tried to call the
   listed tools as its own and gave up. With `session` set to a file, the session is
   continued with `--resume`, so each call sends only the new messages.
-- Failures are `almai.core.LlmError`: `RateLimited(retry_after_ms, …)`, `Overloaded`,
-  `Timeout`, `Transport`, `ContextTooLong`, `ContentFiltered`, `Auth`, `NotFound`,
-  `BadRequest`, `Cancelled`, `Truncated`, … One `core.classify` reads a failed reply,
+- Failures are `almai.core.LlmError`: `ErrRateLimited(retry_after_ms, …)`, `ErrOverloaded`,
+  `ErrTimeout`, `ErrTransport`, `ErrContextTooLong`, `ErrContentFiltered`, `ErrAuth`,
+  `ErrNotFound`, `ErrBadRequest`, `ErrCancelled`, `ErrTruncated`, … (the cases carry
+  their type's name because an Almide case name is visible program-wide, almide#2636,
+  and a bare `Stop` would clobber a user's own type). One `core.classify` reads a failed reply,
   body first (a context overflow comes as a 400); `core.retryable(e)` says whether to
   try again as is and `core.wants_fallback(e)` whether to try another model; Retry-After
   is read from the response headers. `core.error_text(e)` words it as before:
   `status NNN: …`, `transport: …`, `request timeout: …`.
-- `finish` is `Stop | Length | ToolCalls | ContentFilter | OtherFinish(raw)`, from one
+- `finish` is `FinishStop | FinishLength | FinishToolCalls | FinishFiltered | FinishOther(raw)`, from one
   table of every provider's word, with `raw_finish` kept. `usage` splits uncached input,
   cache read, cache write, output and reasoning; a count the provider did not report is
   `none`, not 0. `cost` says where it came from: `"provider"`, `"table"` or `"none"`.
