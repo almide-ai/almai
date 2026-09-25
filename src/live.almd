@@ -4,7 +4,7 @@
 // it. An agent needs more: to show the answer while it is being written, to stop it when
 // the person presses Esc, to give up on a stream that has gone quiet, and to start a
 // second copy of a request that is not arriving. This module does that for the
-// OpenAI-compatible services and for Claude Code's `claude -p`:
+// OpenAI-compatible services, Anthropic, Gemini, and Claude Code's `claude -p`:
 //
 //   let p = live.start(live.Request { model: "cf/glm-5.3", messages: ms, ... }, live.limits())!
 //   while not live.is_done(p)! { show(live.text_so_far(p)!); env.sleep_ms(250) }
@@ -26,18 +26,31 @@
 //                   or CLOUDFLARE_EMAIL with CLOUDFLARE_API_KEY)
 //   openai/, openrouter/, deepseek/, zai/, groq/  that OpenAI-compatible service, NAME_API_KEY
 //   ollama/, lmstudio/                         a local server, no key
+//   anthropic/MODEL                            Anthropic's Messages API, ANTHROPIC_API_KEY
+//                                              (ANTHROPIC_BASE_URL to send it elsewhere)
+//   gemini/MODEL, google/MODEL                 Gemini, GEMINI_API_KEY or GOOGLE_API_KEY
+//                                              (GEMINI_BASE_URL to send it elsewhere)
 //   NAME/MODEL                                 any other: NAME_BASE_URL and NAME_API_KEY
 //   claude, claude/opus, cli/claude            Claude Code's claude -p, on its own login
+//
+// The formats themselves -- the request each API takes and how its stream reads -- are
+// pure functions in almai.wire_openai, wire_anthropic and wire_gemini, and claude -p's
+// prompt, command line and reply in wire_claude; this module runs them. The messages and tools are always in the OpenAI chat shape, whatever the model.
 
-import json
 import env
 import fs
 import process
 import self.core as core
+import self.wire as wire
+import self.wire_openai as wire_openai
+import self.wire_anthropic as wire_anthropic
+import self.wire_gemini as wire_gemini
+import self.wire_claude as wire_claude
 
 // ── Types ──
 
-// `kind` is "chat" (an OpenAI-compatible endpoint) or "claude". `headers` carry the
+// `kind` is the format spoken: "chat" (OpenAI-compatible), "anthropic", "gemini", or
+// "claude" (claude -p). `headers` carry the
 // credentials, and so are only ever written to curl's config file.
 type Endpoint = { kind: String, provider: String, url: String, headers: List[String], model_id: String }
 
@@ -71,7 +84,7 @@ fn limits() -> Limits = Limits { total_s: 900, idle_s: 120 }
 // A request in flight. The shell appends the program's exit status to `out` when it is
 // really finished, which is what "done" means -- the stream having stopped growing does not.
 type Pending = { sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String, headers: String,
-  t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, warnings: List[String] }
+  t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, schema_tool: Bool, warnings: List[String] }
 
 // ── Model ids ──
 
@@ -139,6 +152,20 @@ effect fn endpoint(spec: String) -> Result[Endpoint, String] = {
     else ok(Endpoint { kind: "chat", provider: "cf", url: "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/v1/chat/completions",
       headers: headers, model_id: cf_id_of(model) })
   }
+  else if provider == "anthropic" then {
+    let key = env_of("ANTHROPIC_API_KEY")!
+    let base = if env_of("ANTHROPIC_BASE_URL")! != "" then env_of("ANTHROPIC_BASE_URL")! else "https://api.anthropic.com"
+    if key == "" then err("no ANTHROPIC_API_KEY for " + spec)
+    else ok(Endpoint { kind: "anthropic", provider: "anthropic", url: (string.strip_suffix(base, "/") ?? base) + "/v1/messages",
+      headers: ["x-api-key: " + key, "anthropic-version: 2023-06-01"], model_id: model })
+  }
+  else if provider == "gemini" or provider == "google" then {
+    let key = if env_of("GEMINI_API_KEY")! != "" then env_of("GEMINI_API_KEY")! else env_of("GOOGLE_API_KEY")!
+    let base = if env_of("GEMINI_BASE_URL")! != "" then env_of("GEMINI_BASE_URL")! else "https://generativelanguage.googleapis.com/v1beta"
+    if key == "" then err("no GEMINI_API_KEY (or GOOGLE_API_KEY) for " + spec)
+    else ok(Endpoint { kind: "gemini", provider: "gemini", url: (string.strip_suffix(base, "/") ?? base) + "/models/" + model + ":streamGenerateContent?alt=sse",
+      headers: ["x-goog-api-key: " + key], model_id: model })
+  }
   else {
     let name = env_name(provider)
     let base = if env_of(name + "_BASE_URL")! != "" then env_of(name + "_BASE_URL")! else known_base(provider)
@@ -150,32 +177,21 @@ effect fn endpoint(spec: String) -> Result[Endpoint, String] = {
   }
 }
 
-// ── The chat request ──
+// ── The request ──
 
-// reasoning_effort goes only when `effort` is set: Cloudflare takes it for every model it
-// serves, but elsewhere it is an error on a model that does not reason, so the caller
-// decides. OpenAI wants max_completion_tokens (max_tokens is refused by its reasoning
-// models); the other services read max_tokens.
-fn body(ep: Endpoint, req: Request) -> String = {
-  var fields = [
-    ("model", value.str(ep.model_id)),
-    ("messages", value.array(req.messages)),
-    ("stream", value.bool(true)),
-  ]
-  if not list.is_empty(req.tools) then list.push(fields, ("tools", value.array(req.tools))) else ()
-  if ep.provider == "cf" or ep.provider == "openai" then list.push(fields, ("max_completion_tokens", value.int(req.max_tokens)))
-  else list.push(fields, ("max_tokens", value.int(req.max_tokens)))
-  if req.effort != "" then list.push(fields, ("reasoning_effort", value.str(req.effort))) else ()
-  if ep.provider != "cf" then list.push(fields, ("stream_options", value.object([("include_usage", value.bool(true))]))) else ()
-  if ep.provider == "openrouter" then list.push(fields, ("usage", value.object([("include", value.bool(true))]))) else ()
-  match req.schema {
-    some(s) => list.push(fields, ("response_format", value.object([
-      ("type", value.str("json_schema")),
-      ("json_schema", value.object([("name", value.str("answer")), ("strict", value.bool(true)), ("schema", s)]))]))),
-    none => (),
-  }
-  json.stringify(value.object(fields))
-}
+fn ask_of(ep: Endpoint, req: Request) -> wire.Ask =
+  wire.Ask { model_id: ep.model_id, provider: ep.provider, messages: req.messages, tools: req.tools, max_tokens: req.max_tokens, effort: req.effort, schema: req.schema }
+
+fn encode(ep: Endpoint, req: Request) -> wire.Encoded =
+  if ep.kind == "anthropic" then wire_anthropic.encode(ask_of(ep, req))
+  else if ep.kind == "gemini" then wire_gemini.encode(ask_of(ep, req))
+  else wire_openai.encode(ask_of(ep, req))
+
+// `schema_tool`: an Anthropic request that sent its schema as the "answer" tool.
+fn fold_as(kind: String, schema_tool: Bool, text: String) -> Result[wire.Folded, String] =
+  if kind == "anthropic" then wire_anthropic.fold(text, schema_tool)
+  else if kind == "gemini" then wire_gemini.fold(text)
+  else wire_openai.fold(text)
 
 fn quoted(s: String) -> String = "\"" + string.replace(string.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
 
@@ -196,267 +212,28 @@ fn curl_config(ep: Endpoint, body_path: String, stream_path: String, headers_pat
   string.join(lines, "\n") + "\n"
 }
 
-// ── Reading the stream ──
-
-type Folded = { content: String, reasoning: String, calls: List[ToolCall], finish: String, usage: Value? }
-
-fn num(v: Value?, key: String) -> Int = match v {
-  some(u) => match json.get_int(u, key) { some(n) => n, none => float.to_int(json.get_float(u, key) ?? 0.0) },
-  none => 0,
-}
-
-fn first_some(a: String?, b: String?) -> String? = match a { some(_) => a, none => b }
-
-// A tool call arrives in pieces: the first chunk for an index carries its id and name,
-// later ones carry more of the arguments.
-fn merge_call(calls: List[ToolCall], d: Value) -> List[ToolCall] = {
-  let i = json.get_int(d, "index") ?? list.len(calls)
-  var out = calls
-  while list.len(out) <= i { list.push(out, ToolCall { id: "", name: "", arguments: "" }) }
-  let f = value.field(d, "function") ?? value.object([])
-  let id = json.get_string(d, "id") ?? ""
-  let name = json.get_string(f, "name") ?? ""
-  let args = json.get_string(f, "arguments") ?? ""
-  list.update(out, i, (c) => ToolCall {
-    id: if c.id == "" then id else c.id,
-    name: if c.name == "" then name else c.name,
-    arguments: c.arguments + args,
-  })
-}
-
-fn fold_delta(acc: Folded, c: Value) -> Folded = {
-  let delta = value.field(c, "delta") ?? (value.field(c, "message") ?? value.object([]))
-  let content = acc.content + (json.get_string(delta, "content") ?? "")
-  let reasoning = acc.reasoning + (first_some(json.get_string(delta, "reasoning_content"), json.get_string(delta, "reasoning")) ?? "")
-  var calls = acc.calls
-  for d in json.get_array(delta, "tool_calls") ?? [] { calls = merge_call(calls, d) }
-  Folded { content: content, reasoning: reasoning, calls: calls, finish: json.get_string(c, "finish_reason") ?? acc.finish, usage: acc.usage }
-}
-
-// Mid-stream chunks can carry partial usage; the fullest one is kept.
-fn fold_chunk(acc: Folded, chunk: Value) -> Folded = {
-  let choice = option.map(json.get_array(chunk, "choices"), (cs) => list.first(cs)) |> option.flatten
-  let folded = match choice { some(c) => fold_delta(acc, c), none => acc }
-  match value.field(chunk, "usage") {
-    ok(u) => if num(some(u), "completion_tokens") >= num(folded.usage, "completion_tokens")
-      then Folded { content: folded.content, reasoning: folded.reasoning, calls: folded.calls, finish: folded.finish, usage: some(u) }
-      else folded,
-    err(_) => folded,
-  }
-}
-
-// A streamed body is `data: {chunk}` lines; a service that ignored `stream` sends one
-// completion, which folds the same way through `message` instead of `delta`.
-fn fold(text: String) -> Result[Folded, String] = {
-  var acc = Folded { content: "", reasoning: "", calls: [], finish: "", usage: none }
-  var failure = ""
-  let streamed = string.starts_with(string.trim_start(text), "data:")
-  let payloads = if streamed then list.map(list.filter(string.split(text, "\n"), (l) => string.starts_with(l, "data:")), (l) => string.trim(string.drop(l, 5))) else [text]
-  for p in payloads {
-    if failure == "" and p != "" and p != "[DONE]" then {
-      match json.parse(p) {
-        err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
-        ok(chunk) => match value.field(chunk, "error") {
-          ok(e) => { failure = "api error: " + json.stringify(e) },
-          err(_) => { acc = fold_chunk(acc, chunk) },
-        },
-      }
-    } else ()
-  }
-  if failure != "" then err(failure) else ok(acc)
-}
-
-let NEURON_USD = 0.011 / 1000.0
-
-fn field_of(v: Value?, key: String) -> Value? = match v {
-  some(x) => match value.field(x, key) { ok(y) => some(y), err(_) => none },
-  none => none,
-}
-
-// A count, or none when the field is not there at all.
-fn opt_num(v: Value?, key: String) -> Int? = match field_of(v, key) {
-  some(_) => some(num(v, key)),
-  none => none,
-}
-
-// The chat-completions usage in almai.core's terms: prompt_tokens includes the cached
-// ones, completion_tokens the reasoning ones.
-fn usage_of(u: Value?) -> core.Usage = match u {
-  none => core.no_usage(),
-  some(_) => {
-    let details = field_of(u, "prompt_tokens_details")
-    let cached = if option.is_some(field_of(details, "cached_tokens")) then opt_num(details, "cached_tokens") else opt_num(u, "cached_tokens")
-    let prompt = opt_num(u, "prompt_tokens")
-    core.Usage { input: option.map(prompt, (n) => int.max(0, n - core.count(cached))), cache_read: cached,
-      cache_write: opt_num(u, "cache_creation_input_tokens"), output: opt_num(u, "completion_tokens"),
-      reasoning: opt_num(field_of(u, "completion_tokens_details"), "reasoning_tokens") }
-  },
-}
+// ── The answer ──
 
 // The provider's own meter first; then the price table; else not known.
-fn cost_of(u: Value?, usage: core.Usage, ep: Endpoint) -> core.Cost = {
-  let neurons = option.map(u, (x) => json.get_float(x, "neurons") ?? float.from_int(json.get_int(x, "neurons") ?? -1)) ?? -1.0
-  let reported = option.map(u, (x) => json.get_float(x, "cost") ?? -1.0) ?? -1.0
-  if neurons >= 0.0 then core.Cost { usd: neurons * NEURON_USD, source: "provider" }
-  else if reported >= 0.0 then core.Cost { usd: reported, source: "provider" }
+fn cost_of(f: wire.Folded, ep: Endpoint) -> core.Cost =
+  if f.meter >= 0.0 then core.Cost { usd: f.meter, source: "provider" }
   else match price_of(ep) {
-    some(p) => core.Cost { usd: (float.from_int(core.count(usage.input)) * p.input + float.from_int(core.count(usage.cache_read)) * p.cached
-      + float.from_int(core.count(usage.output)) * p.output) / 1000000.0, source: "table" },
+    some(p) => core.Cost { usd: (float.from_int(core.count(f.usage.input)) * p.input + float.from_int(core.count(f.usage.cache_read)) * p.cached
+      + float.from_int(core.count(f.usage.output)) * p.output) / 1000000.0, source: "table" },
     none => core.no_cost(),
   }
-}
 
-fn reply_of(f: Folded, ep: Endpoint, ms: Int, warnings: List[String]) -> Reply = {
-  let calls = list.filter(f.calls, (c) => c.name != "")
-  let usage = usage_of(f.usage)
+fn reply_of(f: wire.Folded, ep: Endpoint, ms: Int, warnings: List[String]) -> Reply = {
+  let calls = list.map(list.filter(f.calls, (c) => c.name != ""), (c) => ToolCall { id: c.id, name: c.name, arguments: c.arguments })
   Reply { content: f.content, reasoning: f.reasoning, calls: calls, finish: core.settled_finish(f.finish, not list.is_empty(calls)), raw_finish: f.finish,
-    usage: usage, cost: cost_of(f.usage, usage, ep), warnings: warnings, ms: ms }
+    usage: f.usage, cost: cost_of(f, ep), warnings: warnings, ms: ms }
 }
-
-// ── claude -p ──
-//
-// Claude Code as the model and nothing more: its own tools off (--tools ""), no settings,
-// hooks or MCP servers of the person's (--setting-sources "", --strict-mcp-config). Its
-// global CLAUDE.md and memory are still read: only --bare leaves them out, and --bare
-// takes an API key, not a Claude login.
-//
-// With a schema the answer comes through --json-schema. With tools it comes as one JSON
-// object written in the reply's text: through --json-schema the schema reaches the model
-// as a tool of its own, and a model holding one tool called the caller's tools as tools
-// too, got "No such tool available" for each and gave up -- 2 of 3 runs measured
-// 2026-09-25 (claude 2.1.282). With no tool at all, 3 of 3 answered in one turn.
-//
-// With `session` set, the session is continued with --resume, so a call sends only the
-// messages new since the last one; it starts over when there is none yet, when the
-// conversation got shorter, or when the model changed.
-
-let CLAUDE_PROTOCOL = """
-How you act here: you are the model inside an agent that runs the actions listed below for you. You have no tools in this session. Reply with exactly one JSON object and nothing else, no code fence:
-{"content": "<words for the user>", "tool_calls": [{"name": "<action>", "arguments": {<its parameters>}}]}
-Put the actions you want in tool_calls; several independent ones can go in one reply. Their results come back as the next message. To answer the user, write the answer in content and leave tool_calls empty.
-"""
-
-type ClaudeSession = { id: String, sent: Int, model: String }
-
-fn str_of(v: Value, key: String) -> String = json.get_string(v, key) ?? ""
-
-fn claude_system(messages: List[Value], tools: List[Value]) -> String = {
-  let first = list.first(messages) ?? value.object([])
-  let system = if str_of(first, "role") == "system" then str_of(first, "content") else ""
-  if list.is_empty(tools) then (if system == "" then "Answer the request exactly as asked." else system)
-  else system + "\n" + CLAUDE_PROTOCOL + "\nActions:\n" + string.join(list.map(tools, (t) => {
-    let f = value.field(t, "function") ?? value.object([])
-    "- " + str_of(f, "name") + ": " + str_of(f, "description") + "\n  parameters: " + json.stringify(value.field(f, "parameters") ?? value.object([]))
-  }), "\n")
-}
-
-fn call_name(messages: List[Value], id: String) -> String = {
-  var name = "tool"
-  for m in messages {
-    for c in json.get_array(m, "tool_calls") ?? [] {
-      if str_of(c, "id") == id then { name = str_of(value.field(c, "function") ?? value.object([]), "name") } else ()
-    }
-  }
-  name
-}
-
-// Messages from `from` on, as the text of one prompt. A continued session has its own
-// answers already, so they are left out; a fresh one gets the conversation so far. A
-// conversation of one user message is that message as it is.
-fn claude_prompt(messages: List[Value], from: Int, fresh: Bool) -> String = {
-  let rest = list.drop(messages, from)
-  let users = list.filter(rest, (m) => str_of(m, "role") != "system")
-  if fresh and list.len(users) == 1 and str_of(list.first(users) ?? value.object([]), "role") == "user" then str_of(list.first(users) ?? value.object([]), "content")
-  else {
-    var parts: List[String] = []
-    for m in rest {
-      let role = str_of(m, "role")
-      if role == "user" then list.push(parts, (if fresh then "User: " else "") + str_of(m, "content"))
-      else if role == "tool" then list.push(parts, "Result of " + call_name(messages, str_of(m, "tool_call_id")) + ":\n" + str_of(m, "content"))
-      else if role == "assistant" and fresh then {
-        let calls = list.map(json.get_array(m, "tool_calls") ?? [], (c) => {
-          let f = value.field(c, "function") ?? value.object([])
-          str_of(f, "name") + " " + str_of(f, "arguments")
-        })
-        list.push(parts, "You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + string.join(calls, "; ")))
-      } else ()
-    }
-    string.join(parts, "\n\n")
-  }
-}
-
-fn session_of(text: String) -> ClaudeSession? = match json.parse(text) {
-  ok(v) => if str_of(v, "id") == "" then none else some(ClaudeSession { id: str_of(v, "id"), sent: json.get_int(v, "sent") ?? 0, model: str_of(v, "model") }),
-  err(_) => none,
-}
-
-fn session_text(s: ClaudeSession) -> String =
-  json.stringify(value.object([("id", value.str(s.id)), ("sent", value.int(s.sent)), ("model", value.str(s.model))]))
-
-fn continuing(s: ClaudeSession?, message_count: Int, model: String) -> ClaudeSession? = match s {
-  some(x) => if x.model == model and x.sent <= message_count and x.sent > 0 then some(x) else none,
-  none => none,
-}
-
-fn sh_quote(s: String) -> String = "'" + string.replace(s, "'", "'\\''") + "'"
-
-fn claude_command(model_id: String, resume: String, system_path: String, schema: Value?, keep: Bool) -> String = {
-  var args = ["claude", "-p", "--output-format", "json", "--tools", "", "--setting-sources", "", "--strict-mcp-config"]
-  if not keep then { args = args + ["--no-session-persistence"] } else ()
-  match schema { some(sc) => { args = args + ["--json-schema", json.stringify(sc)] }, none => () }
-  if model_id != "" then { args = args + ["--model", model_id] } else ()
-  if resume != "" then { args = args + ["--resume", resume] } else { args = args + ["--system-prompt-file", system_path] }
-  string.join(list.map(args, sh_quote), " ")
-}
-
-// The JSON object in a reply's text, from the first "{" to the last "}".
-fn object_in(text: String) -> Value? =
-  match (string.index_of(text, "{"), string.last_index_of(text, "}")) {
-    (some(a), some(b)) => if b > a then (match json.parse(string.slice(text, a, b + 1)) { ok(v) => some(v), err(_) => none }) else none,
-    _ => none,
-  }
-
-// claude -p --output-format json prints one object: the answer in structured_output
-// (with a schema) or in result, or is_error with what went wrong.
-fn claude_reply(out: String, code: Int, said: String, tools: Bool, ms: Int, warnings: List[String]) -> Result[(Reply, String), core.LlmError] =
-  match json.parse(string.trim(out)) {
-    err(_) => err(if code == 127 then core.ErrConfig("claude is not installed (no `claude` on PATH)")
-      else if code == 143 or code == 137 then core.ErrCancelled
-      else core.ErrUnreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
-    // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
-    ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
-      else {
-        let text = str_of(r, "result")
-        let (content, calls) = match value.field(r, "structured_output") {
-          ok(so) => (json.stringify(so), []),
-          err(_) => if not tools then (text, [])
-            else match object_in(text) {
-              some(v) => if option.is_some(json.get_array(v, "tool_calls")) or option.is_some(json.get_string(v, "content")) then
-                  (str_of(v, "content"), list.map(json.get_array(v, "tool_calls") ?? [], (c) =>
-                    ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.field(c, "arguments") ?? value.object([])) }))
-                else (text, []),
-              none => (text, []),
-            },
-        }
-        let u = field_of(some(r), "usage")
-        let raw = str_of(r, "stop_reason")
-        ok((Reply { content: content, reasoning: "", calls: calls, finish: core.settled_finish(raw, not list.is_empty(calls)), raw_finish: raw,
-          usage: core.Usage { input: opt_num(u, "input_tokens"), cache_read: opt_num(u, "cache_read_input_tokens"), cache_write: opt_num(u, "cache_creation_input_tokens"),
-            output: opt_num(u, "output_tokens"), reasoning: none },
-          cost: match json.get_float(r, "total_cost_usd") { some(c) => core.Cost { usd: c, source: "provider" }, none => core.no_cost() },
-          warnings: warnings, ms: ms }, str_of(r, "session_id")))
-      },
-  }
 
 // ── In flight ──
 
 effect fn temp(prefix: String) -> Result[String, core.LlmError] = fs.create_temp_file(prefix) |> result.map_err((e) => core.ErrConfig("temp file: " + e))
 
-// What this request asks for that its endpoint will not do.
-fn warnings_for(ep: Endpoint, req: Request) -> List[String] =
-  if ep.kind != "claude" then []
-  else (if req.effort != "" then ["claude -p takes no reasoning effort; \"" + req.effort + "\" was not sent"] else [])
-    + (if option.is_some(req.schema) and not list.is_empty(req.tools) then ["with tools, claude -p answers as JSON text; the schema was not sent"] else [])
+fn sh_quote(s: String) -> String = "'" + string.replace(s, "'", "'\\''") + "'"
 
 effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   let ep = endpoint(req.model) |> result.map_err((e) => core.ErrConfig(e))!
@@ -470,17 +247,18 @@ effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   // The program runs in the background so its own pid is known: killing the shell alone
   // would leave the request running, still streaming and still billed.
   let tail = " & p=$!; echo $p > " + sh_quote(pid_path) + "; wait $p; "
+  let encoded = if ep.kind == "claude" then wire.Encoded { body: "", warnings: wire_claude.warnings(ask_of(ep, req)) } else encode(ep, req)
   let script = if ep.kind == "claude" then {
-    let session = if req.session == "" then none else continuing(session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
+    let session = if req.session == "" then none else wire_claude.continuing(wire_claude.session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
     let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
-    fs.write(body_path, claude_prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-    fs.write(cfg_path, claude_system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+    fs.write(body_path, wire_claude.prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+    fs.write(cfg_path, wire_claude.system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
     // From the temp directory, so no project file of the person's is read as memory and
     // the sessions are filed apart from theirs.
-    "cd \"$" + "{TMPDIR:-/tmp}\" && (" + claude_command(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != "") + ") < " + sh_quote(body_path)
+    "cd \"$" + "{TMPDIR:-/tmp}\" && (" + string.join(list.map(wire_claude.args(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != ""), sh_quote), " ") + ") < " + sh_quote(body_path)
       + " > " + sh_quote(stream_path) + " 2> " + sh_quote(err_path) + tail + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
   } else {
-    fs.write(body_path, body(ep, req)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+    fs.write(body_path, encoded.body) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
     fs.write(cfg_path, curl_config(ep, body_path, stream_path, headers_path, l)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
     "curl --config " + sh_quote(cfg_path) + " > " + sh_quote(out_path) + " 2> " + sh_quote(err_path)
       + tail + "printf '\\n%s\\n' \"$?\" >> " + sh_quote(out_path)
@@ -488,7 +266,8 @@ effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.ErrTransport("spawn: " + e))!
   ok(Pending { sh_pid: pid, pid_file: pid_path, stream: stream_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, headers: headers_path,
     t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
-    tools: not list.is_empty(req.tools), warnings: warnings_for(ep, req) })
+    tools: not list.is_empty(req.tools), schema_tool: ep.kind == "anthropic" and wire_anthropic.schema_as_tool(ask_of(ep, req)),
+    warnings: encoded.warnings })
 }
 
 // `out` is the HTTP status with no newline, then the exit status on its own line.
@@ -503,13 +282,11 @@ fn exit_of(out: String) -> (Int, Int)? = {
 
 effect fn is_done(p: Pending) -> Bool = option.is_some(exit_of(fs.read_text(p.out) ?? ""))
 
-fn whole_lines(s: String) -> String = match string.last_index_of(s, "\n") { some(i) => string.take(s, i + 1), none => "" }
-
 // What the model has written so far, from the chunks that arrived whole. claude -p
 // answers all at once, so "" until then.
 effect fn text_so_far(p: Pending) -> String =
   if p.kind == "claude" then ""
-  else match fold(whole_lines(fs.read_text(p.stream) ?? "")) {
+  else match fold_as(p.kind, p.schema_tool, wire.whole_lines(fs.read_text(p.stream) ?? "")) {
     ok(f) => f.content,
     err(_) => "",
   }
@@ -549,10 +326,10 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
   let ms = env.millis() - p.t0
   let _ = clean_up(p)
   if p.kind == "claude" then {
-    match claude_reply(text, code, said, p.tools, ms, p.warnings) {
-      ok((r, sid)) => {
-        if p.session != "" and sid != "" then { let _ = fs.write(p.session, session_text(ClaudeSession { id: sid, sent: p.sent, model: p.model })); () } else ()
-        ok(r)
+    match wire_claude.read(text, code, said, p.tools) {
+      ok((f, sid)) => {
+        if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () } else ()
+        ok(reply_of(f, Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
       },
       err(e) => err(e),
     }
@@ -561,7 +338,7 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
   else if code == 143 or code == 137 then err(core.ErrCancelled)
   else if code != 0 then err(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
   else if status < 200 or status >= 300 then err(core.classify(status, text, core.retry_after_in(headers)))
-  else match fold(text) {
+  else match fold_as(p.kind, p.schema_tool, text) {
     // An error sent inside the stream, after a 200: read like a failed reply's body.
     err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, core.retry_after_in(headers)) else core.ErrUnreadable(e)),
     ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
@@ -632,81 +409,34 @@ test "a model id splits at the first / or :" {
   assert_eq(cf_id_of("glm-5.3"), "@cf/zai-org/glm-5.3")
 }
 
-test "each service gets the fields it reads" {
-  let req = Request { model: "m", messages: [], max_tokens: 100, effort: "low" }
-  let ep = (p: String) => Endpoint { kind: "chat", provider: p, url: "", headers: [], model_id: "m" }
-  let cf = body(ep("cf"), req)
-  assert(string.contains(cf, "\"reasoning_effort\":\"low\"") and string.contains(cf, "\"max_completion_tokens\":100") and not string.contains(cf, "stream_options"))
-  let oa = body(ep("openai"), Request { model: "m", messages: [], max_tokens: 100 })
-  assert(not string.contains(oa, "reasoning_effort") and string.contains(oa, "max_completion_tokens") and string.contains(oa, "include_usage"))
-  assert(string.contains(body(ep("groq"), req), "\"max_tokens\":100"))
-  let schema = body(ep("cf"), Request { model: "m", messages: [], schema: some(value.object([("type", value.str("object"))])) })
-  assert(string.contains(schema, "\"json_schema\""))
+test "each endpoint's format gets the request, and its answer is read back the same way" {
+  let req = Request { model: "m", messages: [value.object([("role", value.str("system")), ("content", value.str("sys"))])], max_tokens: 100 }
+  let ep = (kind: String, p: String) => Endpoint { kind: kind, provider: p, url: "", headers: [], model_id: "m" }
+  assert(string.contains(encode(ep("chat", "cf"), req).body, "\"max_completion_tokens\":100"))
+  assert(string.contains(encode(ep("anthropic", "anthropic"), req).body, "\"system\":\"sys\""))
+  assert(string.contains(encode(ep("gemini", "gemini"), req).body, "\"systemInstruction\""))
+  let anthropic = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n"
+  assert_eq(option.map(result.to_option(fold_as("anthropic", false, anthropic)), (f) => f.content), some("hi"))
+  assert_eq(option.map(result.to_option(fold_as("gemini", false, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n")), (f) => f.content), some("hi"))
 }
 
-test "tool calls are put back together from their pieces" {
-  let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Let me look.\"}}]}\n"
-    + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n"
-    + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a.py\\\"}\"}}]}}]}\n"
-    + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
-    + "data: [DONE]\n"
-  let f = fold(sse) ?? Folded { content: "", reasoning: "", calls: [], finish: "", usage: none }
-  assert_eq(f.content, "Let me look.")
-  assert_eq(f.calls, [ToolCall { id: "c1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
+test "the cost is the provider's meter, else the price table, else not known" {
+  let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
+  let f = fold_as("chat", false, sse) ?? wire.empty()
   let r = reply_of(f, Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
-  assert_eq((r.usage.input, r.usage.cache_read, r.usage.output, r.usage.cache_write), (some(60), some(40), some(20), none))
-  assert_eq(r.finish, core.FinishToolCalls)
-  assert_eq(r.raw_finish, "tool_calls")
+  assert_eq((r.usage.input, r.usage.cache_read, r.usage.output), (some(60), some(40), some(20)))
+  assert_eq((r.finish, r.raw_finish), (core.FinishToolCalls, "tool_calls"))
   assert(r.cost.usd > 0.0 and r.cost.source == "table")
-  assert(result.is_err(fold("data: {\"error\":{\"message\":\"rate limited\"}}\n")))
+  let metered = wire.Folded { content: "", reasoning: "", calls: [], finish: "stop", usage: core.no_usage(), meter: 0.25 }
+  assert_eq(reply_of(metered, Endpoint { kind: "chat", provider: "openrouter", url: "", headers: [], model_id: "x" }, 1, []).cost, core.Cost { usd: 0.25, source: "provider" })
+  assert_eq(reply_of(wire.empty(), Endpoint { kind: "anthropic", provider: "anthropic", url: "", headers: [], model_id: "x" }, 1, []).cost.source, "none")
 }
 
 test "a request is done only once the shell has written the exit status" {
   assert_eq(exit_of("200"), none)
   assert_eq(exit_of("200\n0\n"), some((200, 0)))
   assert_eq(exit_of("000\n28\n"), some((0, 28)))
-}
-
-test "claude gets the conversation once, then only what is new" {
-  let call = value.object([("id", value.str("c1")), ("type", value.str("function")),
-    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))])
-  let ms = [
-    value.object([("role", value.str("system")), ("content", value.str("sys"))]),
-    value.object([("role", value.str("user")), ("content", value.str("fix a.py"))]),
-    value.object([("role", value.str("assistant")), ("content", value.str("")), ("tool_calls", value.array([call]))]),
-    value.object([("role", value.str("tool")), ("tool_call_id", value.str("c1")), ("content", value.str("1 x = 1"))]),
-  ]
-  assert_eq(claude_prompt(ms, 3, false), "Result of read:\n1 x = 1")
-  assert(string.starts_with(claude_prompt(ms, 0, true), "User: fix a.py\n\nYou said: \nYou called: read"))
-  assert_eq(claude_prompt(list.take(ms, 2), 0, true), "fix a.py")
-  let s = some(ClaudeSession { id: "abc", sent: 4, model: "claude" })
-  assert_eq(continuing(s, 6, "claude"), s)
-  assert_eq(continuing(s, 2, "claude"), none)
-  assert_eq(session_of(session_text(ClaudeSession { id: "abc", sent: 4, model: "claude" })), s)
-}
-
-test "claude's answer: the JSON in its text with tools, structured_output with a schema, plain words otherwise" {
-  let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.str("s1")),
-    ("result", value.str(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
-  match claude_reply(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true, 5, []) {
-    ok((r, sid)) => { assert_eq(r.calls, [ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(r.finish, core.FinishToolCalls) },
-    err(e) => assert_eq(core.error_text(e), ""),
-  }
-  match claude_reply(wrap("All tests pass."), 0, "", true, 5, []) {
-    ok((r, _)) => { assert_eq(r.content, "All tests pass."); assert(list.is_empty(r.calls)) },
-    err(e) => assert_eq(core.error_text(e), ""),
-  }
-  let structured = "{\"is_error\":false,\"structured_output\":{\"edits\":[]},\"result\":\"\"}"
-  match claude_reply(structured, 0, "", false, 5, []) {
-    ok((r, _)) => assert_eq(r.content, "{\"edits\":[]}"),
-    err(e) => assert_eq(core.error_text(e), ""),
-  }
-  assert(result.is_err(claude_reply("{\"is_error\":true,\"result\":\"Not logged in\"}", 1, "", true, 5, [])))
-  assert_eq(claude_reply("", 127, "sh: claude: not found", true, 5, []), err(core.ErrConfig("claude is not installed (no `claude` on PATH)")))
-  match claude_reply("{\"is_error\":true,\"result\":\"API Error: 529 {\\\"type\\\":\\\"overloaded_error\\\"}\"}", 1, "", true, 5, []) {
-    err(e) => assert(core.retryable(e)),
-    ok(_) => assert(false),
-  }
 }
 
 // The stop path is the one that leaks money: a request whose program outlives the shell
@@ -725,7 +455,7 @@ test "cancel stops the work the request spawned, not only its shell" {
   // next append, which would hide the very thing measured.
   let scratch = fs.create_temp_file("almai-test-scratch")!
   cancel(Pending { sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
-    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: limits(), tools: false, warnings: [] })!
+    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: limits(), tools: false, schema_tool: false, warnings: [] })!
   env.sleep_ms(400)
   let just_after = string.len(fs.read_text(sink) ?? "")
   env.sleep_ms(400)

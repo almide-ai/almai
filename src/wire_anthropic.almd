@@ -1,0 +1,259 @@
+// almai.wire_anthropic — Anthropic's Messages API.
+//
+// The conversation arrives in the OpenAI chat shape and goes out as Messages:
+//   - the system messages become the top-level `system`
+//   - an assistant's tool calls become `tool_use` blocks, their arguments parsed to the
+//     object Anthropic wants
+//   - a tool result becomes a `tool_result` block in a user turn, and the results of one
+//     round of parallel calls go back in one turn, as Anthropic asks
+//   - reasoning effort becomes a `thinking` budget in tokens
+//   - a schema becomes a tool named "answer" the model is made to call, the one way every
+//     Claude model takes; its input is the answer
+//
+// The stream is typed events: message_start (the input usage), content_block_start and
+// content_block_delta (text, a tool call's arguments in pieces, thinking),
+// message_delta (the stop reason and the output count), message_stop, and error.
+
+import json
+import self.core as core
+import self.wire as wire
+
+let ANSWER_TOOL = "answer"
+
+fn text_block(text: String) -> Value = value.object([("type", value.str("text")), ("text", value.str(text))])
+
+fn tool_use_block(c: Value) -> Value = {
+  let f = value.field(c, "function") ?? value.object([])
+  value.object([("type", value.str("tool_use")), ("id", value.str(wire.str_of(c, "id"))), ("name", value.str(wire.str_of(f, "name"))),
+    ("input", wire.arguments_object(wire.str_of(f, "arguments")))])
+}
+
+// One OpenAI-shaped message as (role, blocks); a system message is none.
+fn turn_of(m: Value) -> (String, List[Value])? = {
+  let role = wire.str_of(m, "role")
+  let text = wire.str_of(m, "content")
+  if role == "system" then none
+  else if role == "tool" then some(("user", [value.object([("type", value.str("tool_result")),
+    ("tool_use_id", value.str(wire.str_of(m, "tool_call_id"))), ("content", value.str(text))])]))
+  else if role == "assistant" then some(("assistant", (if text == "" then [] else [text_block(text)])
+    + list.map(json.get_array(m, "tool_calls") ?? [], tool_use_block)))
+  else some(("user", if text == "" then [] else [text_block(text)]))
+}
+
+// Turns of the same role run together, so a round of tool results is one user turn.
+fn messages_of(messages: List[Value]) -> List[Value] = {
+  var turns: List[(String, List[Value])] = []
+  for m in messages {
+    match turn_of(m) {
+      none => (),
+      some((role, blocks)) => if list.is_empty(blocks) then ()
+        else match list.last(turns) {
+          some((r, bs)) => if r == role then { turns = list.update(turns, list.len(turns) - 1, (_) => (r, bs + blocks)) } else list.push(turns, (role, blocks)),
+          none => list.push(turns, (role, blocks)),
+        },
+    }
+  }
+  list.map(turns, (t) => value.object([("role", value.str(t.0)), ("content", value.array(t.1))]))
+}
+
+fn tools_of(tools: List[Value]) -> List[Value] = list.map(tools, (t) => {
+  let f = value.field(t, "function") ?? value.object([])
+  value.object([("name", value.str(wire.str_of(f, "name"))), ("description", value.str(wire.str_of(f, "description"))),
+    ("input_schema", value.field(f, "parameters") ?? value.object([("type", value.str("object"))]))])
+})
+
+// Whether the schema goes as the forced "answer" tool: only with no tools of the caller's,
+// which the model must stay free to choose among.
+fn schema_as_tool(ask: wire.Ask) -> Bool = option.is_some(ask.schema) and list.is_empty(ask.tools)
+
+// Thinking is sent when it can be: Anthropic refuses it beside a forced tool, and on a
+// conversation whose earlier tool calls come back without the thinking that led to them
+// -- which is every conversation in the OpenAI shape, since it has nowhere to keep it.
+fn thinking_of(ask: wire.Ask) -> (Int, String) = {
+  let budget = wire.budget_for(ask.effort)
+  let used_tools = list.any(ask.messages, (m) => not list.is_empty(json.get_array(m, "tool_calls") ?? []))
+  if ask.effort == "" then (0, "")
+  else if budget < 1024 then (0, "reasoning effort \"" + ask.effort + "\" is not a level or a token budget of at least 1024; no thinking was asked for")
+  else if schema_as_tool(ask) then (0, "the answer's schema is a forced tool, which Anthropic takes only without thinking; no thinking was asked for")
+  else if used_tools then (0, "the conversation's earlier tool calls carry no thinking blocks, which Anthropic requires once thinking is on; no thinking was asked for")
+  else if budget >= ask.max_tokens then (0, "a thinking budget must be below max_tokens (" + int.to_string(ask.max_tokens) + "); no thinking was asked for")
+  else (budget, "")
+}
+
+fn encode(ask: wire.Ask) -> wire.Encoded = {
+  let system = wire.system_of(ask.messages)
+  let (budget, thinking_warning) = thinking_of(ask)
+  var fields = [
+    ("model", value.str(ask.model_id)),
+    ("max_tokens", value.int(ask.max_tokens)),
+    ("messages", value.array(messages_of(ask.messages))),
+    ("stream", value.bool(true)),
+  ]
+  if system != "" then list.push(fields, ("system", value.str(system))) else ()
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(tools_of(ask.tools)))) else ()
+  match ask.schema {
+    some(s) => if schema_as_tool(ask) then {
+      list.push(fields, ("tools", value.array([value.object([("name", value.str(ANSWER_TOOL)),
+        ("description", value.str("Give your answer by calling this, with the answer as its input.")), ("input_schema", s)])])))
+      list.push(fields, ("tool_choice", value.object([("type", value.str("tool")), ("name", value.str(ANSWER_TOOL))])))
+    } else (),
+    none => (),
+  }
+  if budget > 0 then list.push(fields, ("thinking", value.object([("type", value.str("enabled")), ("budget_tokens", value.int(budget))]))) else ()
+  let warnings = (if thinking_warning == "" then [] else [thinking_warning])
+    + (if option.is_some(ask.schema) and not list.is_empty(ask.tools) then ["with tools, Anthropic has no way to hold the answer to a schema; the schema was not sent"] else [])
+  wire.Encoded { body: json.stringify(value.object(fields)), warnings: warnings }
+}
+
+// Anthropic's usage: input_tokens already leaves out the cached tokens.
+fn usage_of(u: Value?) -> core.Usage =
+  core.Usage { input: wire.opt_num(u, "input_tokens"), cache_read: wire.opt_num(u, "cache_read_input_tokens"),
+    cache_write: wire.opt_num(u, "cache_creation_input_tokens"), output: wire.opt_num(u, "output_tokens"), reasoning: none }
+
+fn with_calls(f: wire.Folded, calls: List[wire.ToolCall]) -> wire.Folded =
+  wire.Folded { content: f.content, reasoning: f.reasoning, calls: calls, finish: f.finish, usage: f.usage, meter: f.meter }
+
+// A content block, whole (a reply that was not streamed) or as it starts.
+fn add_block(f: wire.Folded, b: Value) -> wire.Folded = {
+  let kind = wire.str_of(b, "type")
+  if kind == "text" then wire.Folded { content: f.content + wire.str_of(b, "text"), reasoning: f.reasoning, calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
+  else if kind == "thinking" then wire.Folded { content: f.content, reasoning: f.reasoning + wire.str_of(b, "thinking"), calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
+  else if kind == "tool_use" then {
+    // A streamed tool_use starts with an empty input, and its arguments follow in pieces.
+    let input = match value.field(b, "input") { ok(v) => json.stringify(v), err(_) => "" }
+    with_calls(f, f.calls + [wire.ToolCall { id: wire.str_of(b, "id"), name: wire.str_of(b, "name"), arguments: if input == "{}" then "" else input }])
+  }
+  else f
+}
+
+fn add_delta(f: wire.Folded, d: Value, call: Int?) -> wire.Folded = {
+  let kind = wire.str_of(d, "type")
+  if kind == "text_delta" then wire.Folded { content: f.content + wire.str_of(d, "text"), reasoning: f.reasoning, calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
+  else if kind == "thinking_delta" then wire.Folded { content: f.content, reasoning: f.reasoning + wire.str_of(d, "thinking"), calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
+  else if kind == "input_json_delta" then match call {
+    some(i) => with_calls(f, list.update(f.calls, i, (c) => wire.ToolCall { id: c.id, name: c.name, arguments: c.arguments + wire.str_of(d, "partial_json") })),
+    none => f,
+  }
+  else f
+}
+
+fn finished(f: wire.Folded, stop: String, usage: core.Usage) -> wire.Folded =
+  wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: if stop == "" then f.finish else stop,
+    usage: wire.merge_usage(f.usage, usage), meter: f.meter }
+
+// The forced "answer" tool's input is the answer.
+fn answered(f: wire.Folded) -> wire.Folded = match list.find(f.calls, (c) => c.name == ANSWER_TOOL) {
+  some(c) => wire.Folded { content: if c.arguments == "" then "{}" else c.arguments, reasoning: f.reasoning,
+    calls: list.filter(f.calls, (x) => x.name != ANSWER_TOOL), finish: if f.finish == "tool_use" then "end_turn" else f.finish, usage: f.usage, meter: f.meter },
+  none => f,
+}
+
+// `schema_tool`: the request sent its schema as the "answer" tool (see `schema_as_tool`).
+fn fold(text: String, schema_tool: Bool) -> Result[wire.Folded, String] = {
+  var acc = wire.empty()
+  var failure = ""
+  // Content block index -> the position of its tool call in `calls`.
+  var blocks: List[(Int, Int)] = []
+  for p in wire.payloads(text) {
+    if failure == "" then {
+      match json.parse(p) {
+        err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
+        ok(ev) => {
+          let kind = wire.str_of(ev, "type")
+          if kind == "error" or (kind == "" and option.is_some(wire.field_of(some(ev), "error"))) then { failure = "api error: " + json.stringify(value.field(ev, "error") ?? ev) }
+          else if kind == "message_start" then {
+            let m = wire.field_of(some(ev), "message")
+            acc = finished(acc, "", usage_of(wire.field_of(m, "usage")))
+          }
+          else if kind == "content_block_start" then {
+            let b = value.field(ev, "content_block") ?? value.object([])
+            if wire.str_of(b, "type") == "tool_use" then list.push(blocks, (json.get_int(ev, "index") ?? -1, list.len(acc.calls))) else ()
+            acc = add_block(acc, b)
+          }
+          else if kind == "content_block_delta" then {
+            let i = json.get_int(ev, "index") ?? -1
+            acc = add_delta(acc, value.field(ev, "delta") ?? value.object([]), option.map(list.find(blocks, (b) => b.0 == i), (b) => b.1))
+          }
+          else if kind == "message_delta" then {
+            acc = finished(acc, wire.str_of(value.field(ev, "delta") ?? value.object([]), "stop_reason"), usage_of(wire.field_of(some(ev), "usage")))
+          }
+          // A reply that was not streamed: one message, its content whole.
+          else if kind == "message" then {
+            for b in json.get_array(ev, "content") ?? [] { acc = add_block(acc, b) }
+            acc = finished(acc, wire.str_of(ev, "stop_reason"), usage_of(wire.field_of(some(ev), "usage")))
+          }
+          else ()
+        },
+      }
+    } else ()
+  }
+  // A call to a tool that takes nothing streams no arguments at all.
+  let whole = with_calls(acc, list.map(acc.calls, (c) => wire.ToolCall { id: c.id, name: c.name, arguments: if c.arguments == "" then "{}" else c.arguments }))
+  if failure != "" then err(failure) else ok(if schema_tool then answered(whole) else whole)
+}
+
+fn msg(role: String, content: String) -> Value = value.object([("role", value.str(role)), ("content", value.str(content))])
+
+fn call_msg(ids: List[String]) -> Value = value.object([("role", value.str("assistant")), ("content", value.str("")),
+  ("tool_calls", value.array(list.map(ids, (id) => value.object([("id", value.str(id)), ("type", value.str("function")),
+    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))]))))])
+
+fn result_msg(id: String, content: String) -> Value = value.object([("role", value.str("tool")), ("tool_call_id", value.str(id)), ("content", value.str(content))])
+
+fn ask_of(messages: List[Value], tools: List[Value], effort: String, schema: Value?) -> wire.Ask =
+  wire.Ask { model_id: "claude-sonnet-4-5", provider: "anthropic", messages: messages, tools: tools, max_tokens: 8000, effort: effort, schema: schema }
+
+test "a conversation goes out as Messages: system on top, calls as tool_use, one round of results in one turn" {
+  let ms = [msg("system", "be brief"), msg("user", "fix a.py"), call_msg(["c1", "c2"]), result_msg("c1", "one"), result_msg("c2", "two")]
+  let body = json.parse(encode(ask_of(ms, [], "", none)).body) ?? value.object([])
+  assert_eq(wire.str_of(body, "system"), "be brief")
+  let turns = json.get_array(body, "messages") ?? []
+  assert_eq(list.map(turns, (t) => wire.str_of(t, "role")), ["user", "assistant", "user"])
+  let calls = json.get_array(list.get(turns, 1) ?? value.object([]), "content") ?? []
+  assert_eq(list.map(calls, (b) => wire.str_of(b, "type")), ["tool_use", "tool_use"])
+  assert_eq(json.stringify(value.field(list.first(calls) ?? value.object([]), "input") ?? value.null()), "{\"path\":\"a.py\"}")
+  let results = json.get_array(list.get(turns, 2) ?? value.object([]), "content") ?? []
+  assert_eq(list.map(results, (b) => wire.str_of(b, "tool_use_id")), ["c1", "c2"])
+}
+
+test "effort becomes a thinking budget, and is left out where Anthropic would refuse it, saying so" {
+  let fresh = encode(ask_of([msg("user", "hi")], [], "medium", none))
+  assert(string.contains(fresh.body, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}"))
+  assert(list.is_empty(fresh.warnings))
+  let after_tools = encode(ask_of([msg("user", "hi"), call_msg(["c1"]), result_msg("c1", "x")], [], "medium", none))
+  assert(not string.contains(after_tools.body, "thinking") and list.len(after_tools.warnings) == 1)
+  let schema = encode(ask_of([msg("user", "hi")], [], "high", some(value.object([("type", value.str("object"))]))))
+  assert(string.contains(schema.body, "\"tool_choice\":{\"type\":\"tool\",\"name\":\"answer\"}"))
+  assert(not string.contains(schema.body, "budget_tokens") and list.len(schema.warnings) == 1)
+}
+
+test "a stream is read: text, thinking, a call's arguments in pieces, usage from start and end" {
+  let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n"
+    + "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n"
+    + "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me look.\"}}\n\n"
+    + "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}\n\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"th\\\":\\\"a.py\\\"}\"}}\n\n"
+    + "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    + "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n"
+    + "data: {\"type\":\"message_stop\"}\n\n"
+  let f = fold(sse, false) ?? wire.empty()
+  assert_eq((f.content, f.reasoning, f.finish), ("Let me look.", "hmm", "tool_use"))
+  assert_eq(f.calls, [wire.ToolCall { id: "toolu_1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
+  assert_eq((f.usage.input, f.usage.cache_read, f.usage.cache_write, f.usage.output), (some(12), some(300), some(0), some(40)))
+  assert_eq(core.settled_finish(f.finish, true), core.FinishToolCalls)
+  assert(result.is_err(fold("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n", false)))
+}
+
+test "the forced answer tool's input comes back as the answer" {
+  let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"answer\",\"input\":{}}}\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"ok\\\":true}\"}}\n"
+    + "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n"
+  let f = fold(sse, true) ?? wire.empty()
+  assert_eq((f.content, f.finish, list.len(f.calls)), ("{\"ok\":true}", "end_turn", 0))
+  // Not streamed: the whole message at once.
+  let whole = fold("{\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}", false) ?? wire.empty()
+  assert_eq((whole.content, whole.finish, whole.usage.output), ("hi", "end_turn", some(1)))
+}

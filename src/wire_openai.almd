@@ -1,0 +1,160 @@
+// almai.wire_openai — the chat-completions format: OpenAI, Cloudflare Workers AI,
+// OpenRouter, DeepSeek, Groq, a local Ollama and whatever else speaks it.
+//
+// The services differ in small ways, and the differences live here, keyed on
+// `ask.provider`:
+//   - OpenAI and Cloudflare read max_completion_tokens (OpenAI refuses max_tokens on its
+//     reasoning models); the rest read max_tokens
+//   - usage comes in the stream only when asked for with stream_options, which Cloudflare
+//     does not take (it sends usage anyway, with neurons, its meter)
+//   - OpenRouter reports the cost itself when asked with usage.include
+
+import json
+import self.core as core
+import self.wire as wire
+
+// reasoning_effort goes only when `effort` is set: Cloudflare takes it for every model it
+// serves, but elsewhere it is an error on a model that does not reason, so the caller
+// decides.
+fn encode(ask: wire.Ask) -> wire.Encoded = {
+  var fields = [
+    ("model", value.str(ask.model_id)),
+    ("messages", value.array(ask.messages)),
+    ("stream", value.bool(true)),
+  ]
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(ask.tools))) else ()
+  if ask.provider == "cf" or ask.provider == "openai" then list.push(fields, ("max_completion_tokens", value.int(ask.max_tokens)))
+  else list.push(fields, ("max_tokens", value.int(ask.max_tokens)))
+  if ask.effort != "" then list.push(fields, ("reasoning_effort", value.str(ask.effort))) else ()
+  if ask.provider != "cf" then list.push(fields, ("stream_options", value.object([("include_usage", value.bool(true))]))) else ()
+  if ask.provider == "openrouter" then list.push(fields, ("usage", value.object([("include", value.bool(true))]))) else ()
+  match ask.schema {
+    some(s) => list.push(fields, ("response_format", value.object([
+      ("type", value.str("json_schema")),
+      ("json_schema", value.object([("name", value.str("answer")), ("strict", value.bool(true)), ("schema", s)]))]))),
+    none => (),
+  }
+  wire.Encoded { body: json.stringify(value.object(fields)), warnings: [] }
+}
+
+fn first_some(a: String?, b: String?) -> String? = match a { some(_) => a, none => b }
+
+// A tool call arrives in pieces: the first chunk for an index carries its id and name,
+// later ones carry more of the arguments.
+fn merge_call(calls: List[wire.ToolCall], d: Value) -> List[wire.ToolCall] = {
+  let i = json.get_int(d, "index") ?? list.len(calls)
+  var out = calls
+  while list.len(out) <= i { list.push(out, wire.ToolCall { id: "", name: "", arguments: "" }) }
+  let f = value.field(d, "function") ?? value.object([])
+  let id = json.get_string(d, "id") ?? ""
+  let name = json.get_string(f, "name") ?? ""
+  let args = json.get_string(f, "arguments") ?? ""
+  list.update(out, i, (c) => wire.ToolCall {
+    id: if c.id == "" then id else c.id,
+    name: if c.name == "" then name else c.name,
+    arguments: c.arguments + args,
+  })
+}
+
+fn fold_delta(acc: wire.Folded, c: Value) -> wire.Folded = {
+  let delta = value.field(c, "delta") ?? (value.field(c, "message") ?? value.object([]))
+  var calls = acc.calls
+  for d in json.get_array(delta, "tool_calls") ?? [] { calls = merge_call(calls, d) }
+  wire.Folded { content: acc.content + (json.get_string(delta, "content") ?? ""),
+    reasoning: acc.reasoning + (first_some(json.get_string(delta, "reasoning_content"), json.get_string(delta, "reasoning")) ?? ""),
+    calls: calls, finish: json.get_string(c, "finish_reason") ?? acc.finish, usage: acc.usage, meter: acc.meter }
+}
+
+let NEURON_USD = 0.011 / 1000.0
+
+// The chat-completions usage in almai.core's terms: prompt_tokens includes the cached
+// ones, completion_tokens the reasoning ones.
+fn usage_of(u: Value?) -> core.Usage = match u {
+  none => core.no_usage(),
+  some(_) => {
+    let details = wire.field_of(u, "prompt_tokens_details")
+    let cached = if option.is_some(wire.field_of(details, "cached_tokens")) then wire.opt_num(details, "cached_tokens") else wire.opt_num(u, "cached_tokens")
+    let prompt = wire.opt_num(u, "prompt_tokens")
+    core.Usage { input: option.map(prompt, (n) => int.max(0, n - core.count(cached))), cache_read: cached,
+      cache_write: wire.opt_num(u, "cache_creation_input_tokens"), output: wire.opt_num(u, "completion_tokens"),
+      reasoning: wire.opt_num(wire.field_of(u, "completion_tokens_details"), "reasoning_tokens") }
+  },
+}
+
+// The provider's own meter: Cloudflare's neurons, or OpenRouter's usage.cost.
+fn meter_of(u: Value) -> Float = {
+  let neurons = json.get_float(u, "neurons") ?? float.from_int(json.get_int(u, "neurons") ?? -1)
+  if neurons >= 0.0 then neurons * NEURON_USD
+  else json.get_float(u, "cost") ?? float.from_int(json.get_int(u, "cost") ?? -1)
+}
+
+// Mid-stream chunks can carry partial usage; the fullest one is kept.
+fn fold_chunk(acc: wire.Folded, chunk: Value) -> wire.Folded = {
+  let choice = option.map(json.get_array(chunk, "choices"), (cs) => list.first(cs)) |> option.flatten
+  let folded = match choice { some(c) => fold_delta(acc, c), none => acc }
+  match value.field(chunk, "usage") {
+    ok(u) => if core.count(wire.opt_num(some(u), "completion_tokens")) >= core.count(folded.usage.output)
+      then wire.Folded { content: folded.content, reasoning: folded.reasoning, calls: folded.calls, finish: folded.finish,
+        usage: usage_of(some(u)), meter: meter_of(u) }
+      else folded,
+    err(_) => folded,
+  }
+}
+
+// A streamed body is `data: {chunk}` lines; a service that ignored `stream` sends one
+// completion, which folds the same way through `message` instead of `delta`. An error
+// sent inside the stream fails as "api error: ...".
+fn fold(text: String) -> Result[wire.Folded, String] = {
+  var acc = wire.empty()
+  var failure = ""
+  for p in wire.payloads(text) {
+    if failure == "" then {
+      match json.parse(p) {
+        err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
+        ok(chunk) => match value.field(chunk, "error") {
+          ok(e) => { failure = "api error: " + json.stringify(e) },
+          err(_) => { acc = fold_chunk(acc, chunk) },
+        },
+      }
+    } else ()
+  }
+  if failure != "" then err(failure) else ok(acc)
+}
+
+fn ask_of(provider: String, effort: String, schema: Value?) -> wire.Ask =
+  wire.Ask { model_id: "m", provider: provider, messages: [], tools: [], max_tokens: 100, effort: effort, schema: schema }
+
+test "each service gets the fields it reads" {
+  let cf = encode(ask_of("cf", "low", none)).body
+  assert(string.contains(cf, "\"reasoning_effort\":\"low\"") and string.contains(cf, "\"max_completion_tokens\":100") and not string.contains(cf, "stream_options"))
+  let oa = encode(ask_of("openai", "", none)).body
+  assert(not string.contains(oa, "reasoning_effort") and string.contains(oa, "max_completion_tokens") and string.contains(oa, "include_usage"))
+  assert(string.contains(encode(ask_of("groq", "low", none)).body, "\"max_tokens\":100"))
+  assert(string.contains(encode(ask_of("openrouter", "", none)).body, "\"usage\":{\"include\":true}"))
+  assert(string.contains(encode(ask_of("cf", "", some(value.object([("type", value.str("object"))])))).body, "\"json_schema\""))
+}
+
+test "tool calls are put back together from their pieces" {
+  let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Let me look.\"}}]}\n"
+    + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n"
+    + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a.py\\\"}\"}}]}}]}\n"
+    + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
+    + "data: [DONE]\n"
+  let f = fold(sse) ?? wire.empty()
+  assert_eq(f.content, "Let me look.")
+  assert_eq(f.calls, [wire.ToolCall { id: "c1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
+  assert_eq(f.finish, "tool_calls")
+  assert_eq((f.usage.input, f.usage.cache_read, f.usage.output, f.usage.cache_write), (some(60), some(40), some(20), none))
+  assert(f.meter < 0.0)
+  assert(result.is_err(fold("data: {\"error\":{\"message\":\"rate limited\"}}\n")))
+}
+
+test "the provider's own meter is read: neurons, or OpenRouter's cost" {
+  let cf = fold("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"neurons\":1000}}\n") ?? wire.empty()
+  assert(cf.meter > 0.0105 and cf.meter < 0.0115)
+  let routed = fold("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cost\":0.002}}\n") ?? wire.empty()
+  assert_eq(routed.meter, 0.002)
+  // A service that ignored `stream`: one completion, read through `message`.
+  let whole = fold("{\"choices\":[{\"message\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}") ?? wire.empty()
+  assert_eq((whole.content, whole.finish), ("done", "stop"))
+}

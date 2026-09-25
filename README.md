@@ -157,7 +157,8 @@ if almai.has_tool_calls(r) then {
 `call_with` blocks until the answer is in. An agent needs more: to show the answer as
 it is written, to stop it when the person presses Esc, to give up on a stream that has
 gone quiet, and to start a second copy of a request that is not arriving. `almai.live`
-does that for every OpenAI-compatible service and for Claude Code's `claude -p`, and
+does that for every OpenAI-compatible service, Anthropic, Gemini and Claude Code's
+`claude -p`, and
 [golemide](https://github.com/O6lvl4/golemide) and [comide](https://github.com/O6lvl4/comide)
 are built on it.
 
@@ -183,6 +184,8 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
 | `cf:glm-5.3`, `cf/glm-5.3-flash`, `cf/@cf/…` | Cloudflare Workers AI | `CLOUDFLARE_ACCOUNT_ID` (or `CF_ACCOUNT_ID`) and `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY`) |
 | `openai:…`, `openrouter:…`, `deepseek:…`, `zai:…`, `groq:…` | that OpenAI-compatible service | `OPENAI_API_KEY`, … |
 | `ollama:…`, `lmstudio:…` | a local server | nothing |
+| `anthropic:…` | Anthropic's Messages API | `ANTHROPIC_API_KEY` (`ANTHROPIC_BASE_URL` optional) |
+| `gemini:…`, `google:…` | Gemini's generateContent | `GEMINI_API_KEY` or `GOOGLE_API_KEY` (`GEMINI_BASE_URL` optional) |
 | `NAME:MODEL` | any other OpenAI-compatible service | `NAME_BASE_URL`, `NAME_API_KEY` |
 | `claude`, `claude:opus`, `cli/claude` | Claude Code's `claude -p`, on its own login | `claude` on `PATH` |
 
@@ -191,9 +194,19 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
   requests are always streamed: a non-streamed Cloudflare request past about four
   minutes is ended with `408`. Credentials go in curl's config file, never on a
   command line.
-- `schema` asks for an answer in that JSON Schema (`response_format`, or `--json-schema`
-  for claude). `effort` is sent as `reasoning_effort` only when set: Cloudflare takes it
-  for every model, other services refuse it on a model that does not reason.
+- `messages` and `tools` are in the OpenAI chat shape whatever the model; each format
+  translates them. For Anthropic: the system on top, calls as `tool_use`, a round of
+  results in one user turn. For Gemini: `systemInstruction`, `functionCall` /
+  `functionResponse` matched by name, the tools' JSON Schema as it is.
+- `schema` asks for an answer in that JSON Schema: `response_format`; a forced tool
+  named `answer` for Anthropic, whose input comes back as the content; `responseJsonSchema`
+  for Gemini; `--json-schema` for claude.
+- `effort` is sent only when set. OpenAI-compatible services get `reasoning_effort`:
+  Cloudflare takes it for every model, other services refuse it on a model that does not
+  reason. Anthropic and Gemini get a thinking budget (`low` 1024, `medium` 4096, `high`
+  16384 tokens, or a number). Anthropic's is left out, with a warning, where Anthropic
+  would refuse it: beside the forced `answer` tool, and on a conversation with earlier
+  tool calls, whose thinking blocks the OpenAI shape has nowhere to keep.
 - Cost is the provider's own meter when it reports one (Cloudflare's neurons,
   OpenRouter's `usage.cost`, claude's total), else Cloudflare's price table, else 0.
 - `claude` runs `claude -p` with its tools, settings, hooks and MCP servers off; your
@@ -262,6 +275,12 @@ For custom initial delay, use `call_retry_with_delay(..., max_attempts, base_del
 src/
   mod.almd              Public API, types, dispatch
   live.almd             Calls you can watch, stop and bound in time (curl / claude -p)
+  core.almd             Finish, usage, cost and errors, shared by every provider
+  wire.almd             What the wire formats share: the request asked, the answer read
+  wire_openai.almd      Chat completions: body and stream, pure (OpenAI, Cloudflare, …)
+  wire_anthropic.almd   Anthropic Messages: body and stream, pure
+  wire_gemini.almd      Gemini generateContent: body and stream, pure
+  wire_claude.almd      claude -p: prompt, command line and reply, pure
   tools.almd            Tool calling types and JSON Schema helpers
   conv.almd             Conversation builder
   providers/
@@ -275,7 +294,9 @@ src/
 
 All providers are pure Almide — no external SDK dependencies. The providers under
 `providers/` call the REST API via `http.request`; `almai.live` runs `curl` or `claude`
-in the background.
+in the background, and reads what comes back with the `wire_*` modules. Those hold no
+transport at all: `encode` makes the body, `fold` reads a stream or the part of one
+that has arrived, and a test gives them a recorded stream.
 
 ## License
 

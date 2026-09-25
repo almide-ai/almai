@@ -1,0 +1,175 @@
+// almai.wire_gemini — Google's Gemini API, generateContent.
+//
+// The conversation arrives in the OpenAI chat shape and goes out as Gemini contents:
+//   - the system messages become `systemInstruction`
+//   - the assistant is the role "model"; its tool calls become `functionCall` parts
+//   - a tool result becomes a `functionResponse` part in a user turn, named after the
+//     call it answers (Gemini matches them by name), one round of results in one turn
+//   - tools go as `functionDeclarations` with their JSON Schema as it is
+//     (`parametersJsonSchema`), a schema for the answer as `responseJsonSchema`
+//   - reasoning effort becomes a `thinkingConfig` budget, with the thoughts included so
+//     they can be shown
+//
+// Streamed with `?alt=sse`, every event is a whole GenerateContentResponse: text and
+// thought parts to append, function calls whole, and usageMetadata that grows.
+
+import json
+import self.core as core
+import self.wire as wire
+
+fn text_part(text: String) -> Value = value.object([("text", value.str(text))])
+
+fn call_part(c: Value) -> Value = {
+  let f = value.field(c, "function") ?? value.object([])
+  value.object([("functionCall", value.object([("name", value.str(wire.str_of(f, "name"))), ("args", wire.arguments_object(wire.str_of(f, "arguments")))]))])
+}
+
+// One OpenAI-shaped message as (role, parts); a system message is none. `all` is the whole
+// conversation, where a result's call is looked up for its name.
+fn turn_of(m: Value, all: List[Value]) -> (String, List[Value])? = {
+  let role = wire.str_of(m, "role")
+  let text = wire.str_of(m, "content")
+  if role == "system" then none
+  else if role == "tool" then some(("user", [value.object([("functionResponse", value.object([
+    ("name", value.str(wire.call_name(all, wire.str_of(m, "tool_call_id")))),
+    ("response", value.object([("content", value.str(text))]))]))])]))
+  else if role == "assistant" then some(("model", (if text == "" then [] else [text_part(text)])
+    + list.map(json.get_array(m, "tool_calls") ?? [], call_part)))
+  else some(("user", if text == "" then [] else [text_part(text)]))
+}
+
+fn contents_of(messages: List[Value]) -> List[Value] = {
+  var turns: List[(String, List[Value])] = []
+  for m in messages {
+    match turn_of(m, messages) {
+      none => (),
+      some((role, parts)) => if list.is_empty(parts) then ()
+        else match list.last(turns) {
+          some((r, ps)) => if r == role then { turns = list.update(turns, list.len(turns) - 1, (_) => (r, ps + parts)) } else list.push(turns, (role, parts)),
+          none => list.push(turns, (role, parts)),
+        },
+    }
+  }
+  list.map(turns, (t) => value.object([("role", value.str(t.0)), ("parts", value.array(t.1))]))
+}
+
+fn declarations_of(tools: List[Value]) -> List[Value] = list.map(tools, (t) => {
+  let f = value.field(t, "function") ?? value.object([])
+  value.object([("name", value.str(wire.str_of(f, "name"))), ("description", value.str(wire.str_of(f, "description"))),
+    ("parametersJsonSchema", value.field(f, "parameters") ?? value.object([("type", value.str("object"))]))])
+})
+
+fn encode(ask: wire.Ask) -> wire.Encoded = {
+  let system = wire.system_of(ask.messages)
+  let budget = wire.budget_for(ask.effort)
+  var config = [("maxOutputTokens", value.int(ask.max_tokens))]
+  match ask.schema {
+    some(s) => {
+      list.push(config, ("responseMimeType", value.str("application/json")))
+      list.push(config, ("responseJsonSchema", s))
+    },
+    none => (),
+  }
+  if budget > 0 then list.push(config, ("thinkingConfig", value.object([("thinkingBudget", value.int(budget)), ("includeThoughts", value.bool(true))]))) else ()
+  var fields = [("contents", value.array(contents_of(ask.messages)))]
+  if system != "" then list.push(fields, ("systemInstruction", value.object([("parts", value.array([text_part(system)]))]))) else ()
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array([value.object([("functionDeclarations", value.array(declarations_of(ask.tools)))])]))) else ()
+  list.push(fields, ("generationConfig", value.object(config)))
+  let warnings = if ask.effort != "" and budget == 0 then ["reasoning effort \"" + ask.effort + "\" is not a level or a token budget; no thinking budget was sent"] else []
+  wire.Encoded { body: json.stringify(value.object(fields)), warnings: warnings }
+}
+
+// Gemini's usage: promptTokenCount includes the cached tokens, candidatesTokenCount leaves
+// out the thoughts, which almai.core counts as output.
+fn usage_of(u: Value?) -> core.Usage = match u {
+  none => core.no_usage(),
+  some(_) => {
+    let cached = wire.opt_num(u, "cachedContentTokenCount")
+    let thoughts = wire.opt_num(u, "thoughtsTokenCount")
+    let candidates = wire.opt_num(u, "candidatesTokenCount")
+    core.Usage { input: option.map(wire.opt_num(u, "promptTokenCount"), (n) => int.max(0, n - core.count(cached))), cache_read: cached, cache_write: none,
+      output: match (candidates, thoughts) { (none, none) => none, _ => some(core.count(candidates) + core.count(thoughts)) }, reasoning: thoughts }
+  },
+}
+
+fn add_part(f: wire.Folded, p: Value) -> wire.Folded = match value.field(p, "functionCall") {
+  ok(c) => {
+    let id = wire.str_of(c, "id")
+    wire.Folded { content: f.content, reasoning: f.reasoning, finish: f.finish, usage: f.usage, meter: f.meter,
+      calls: f.calls + [wire.ToolCall { id: if id == "" then "call_" + int.to_string(list.len(f.calls) + 1) else id, name: wire.str_of(c, "name"),
+        arguments: json.stringify(value.field(c, "args") ?? value.object([])) }] }
+  },
+  err(_) => if json.get_bool(p, "thought") ?? false
+    then wire.Folded { content: f.content, reasoning: f.reasoning + wire.str_of(p, "text"), calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
+    else wire.Folded { content: f.content + wire.str_of(p, "text"), reasoning: f.reasoning, calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter },
+}
+
+fn fold_event(acc: wire.Folded, ev: Value) -> wire.Folded = {
+  var f = acc
+  match option.map(json.get_array(ev, "candidates"), (cs) => list.first(cs)) |> option.flatten {
+    some(c) => {
+      for p in json.get_array(value.field(c, "content") ?? value.object([]), "parts") ?? [] { f = add_part(f, p) }
+      let finish = wire.str_of(c, "finishReason")
+      if finish != "" then { f = wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: finish, usage: f.usage, meter: f.meter } } else ()
+    },
+    none => (),
+  }
+  // A prompt blocked before any candidate: the reason is the finish.
+  let blocked = wire.str_of(value.field(ev, "promptFeedback") ?? value.object([]), "blockReason")
+  let usage = wire.field_of(some(ev), "usageMetadata")
+  wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: if blocked != "" then "SAFETY" else f.finish,
+    usage: match usage { some(_) => usage_of(usage), none => f.usage }, meter: f.meter }
+}
+
+fn fold(text: String) -> Result[wire.Folded, String] = {
+  var acc = wire.empty()
+  var failure = ""
+  for p in wire.payloads(text) {
+    if failure == "" then {
+      match json.parse(p) {
+        err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
+        ok(ev) => match value.field(ev, "error") {
+          ok(e) => { failure = "api error: " + json.stringify(e) },
+          err(_) => { acc = fold_event(acc, ev) },
+        },
+      }
+    } else ()
+  }
+  if failure != "" then err(failure) else ok(acc)
+}
+
+fn msg(role: String, content: String) -> Value = value.object([("role", value.str(role)), ("content", value.str(content))])
+
+test "a conversation goes out as contents: system apart, model turns, results named after their calls" {
+  let call = value.object([("id", value.str("c1")), ("type", value.str("function")),
+    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))])
+  let ms = [msg("system", "be brief"), msg("user", "fix a.py"),
+    value.object([("role", value.str("assistant")), ("content", value.str("")), ("tool_calls", value.array([call]))]),
+    value.object([("role", value.str("tool")), ("tool_call_id", value.str("c1")), ("content", value.str("1 x = 1"))])]
+  let tool = value.object([("type", value.str("function")), ("function", value.object([("name", value.str("read")), ("description", value.str("read a file")),
+    ("parameters", value.object([("type", value.str("object"))]))]))])
+  let e = encode(wire.Ask { model_id: "gemini-2.5-flash", provider: "gemini", messages: ms, tools: [tool], max_tokens: 2000, effort: "low", schema: none })
+  let body = json.parse(e.body) ?? value.object([])
+  let turns = json.get_array(body, "contents") ?? []
+  assert_eq(list.map(turns, (t) => wire.str_of(t, "role")), ["user", "model", "user"])
+  assert(string.contains(e.body, "\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.py\"}}"))
+  assert(string.contains(e.body, "\"functionResponse\":{\"name\":\"read\",\"response\":{\"content\":\"1 x = 1\"}}"))
+  assert(string.contains(e.body, "\"systemInstruction\":{\"parts\":[{\"text\":\"be brief\"}]}"))
+  assert(string.contains(e.body, "\"parametersJsonSchema\""))
+  assert(string.contains(e.body, "\"thinkingBudget\":1024"))
+  assert(list.is_empty(e.warnings))
+}
+
+test "a stream is read: thoughts apart, calls whole, the last usage kept" {
+  let sse = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hmm\",\"thought\":true}]}}],\"usageMetadata\":{\"promptTokenCount\":100}}\r\n\r\n"
+    + "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Let me look.\"}]}}]}\r\n\r\n"
+    + "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.py\"}}}]},\"finishReason\":\"STOP\"}],"
+    + "\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":60,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\r\n\r\n"
+  let f = fold(sse) ?? wire.empty()
+  assert_eq((f.content, f.reasoning, f.finish), ("Let me look.", "hmm", "STOP"))
+  assert_eq(f.calls, [wire.ToolCall { id: "call_1", name: "read", arguments: "{\"path\":\"a.py\"}" }])
+  assert_eq((f.usage.input, f.usage.cache_read, f.usage.output, f.usage.reasoning), (some(40), some(60), some(50), some(30)))
+  assert_eq(core.settled_finish(f.finish, true), core.FinishToolCalls)
+  assert_eq(core.finish_of((fold("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n") ?? wire.empty()).finish), core.FinishFiltered)
+  assert(result.is_err(fold("data: {\"error\":{\"code\":429,\"message\":\"Resource exhausted\",\"status\":\"RESOURCE_EXHAUSTED\"}}\n")))
+}

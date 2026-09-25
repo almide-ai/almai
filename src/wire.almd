@@ -1,0 +1,119 @@
+// almai.wire — what the wire formats share: the request as asked, and the answer as read.
+//
+// Each API a provider speaks has a module of pure functions: `encode` turns an Ask into
+// the body to send, `fold` turns what came back -- a whole stream, or the part of one
+// that has arrived -- into a Folded. No transport lives there: almai.live runs the
+// request and calls them, and a test feeds them a recorded stream. (rig keeps its
+// providers this way, `wire.rs`: the encoding pure, the decoding a fold over frames,
+// the transport outside.)
+//
+//   wire_openai     chat completions: OpenAI, Cloudflare, OpenRouter and the rest
+//   wire_anthropic  Anthropic's Messages API
+//   wire_gemini     Google's generateContent
+//
+// The messages come in the OpenAI chat shape, the one almai's callers already hold;
+// each format translates them.
+
+import json
+import self.core as core
+
+type ToolCall = { id: String, name: String, arguments: String }
+
+// `model_id` is what the provider calls the model; `provider` picks the quirks inside a
+// format ("cf", "openai", "openrouter", ...). `effort` is "" for none.
+type Ask = { model_id: String, provider: String, messages: List[Value], tools: List[Value], max_tokens: Int, effort: String, schema: Value? }
+
+// The request to send, and what of the Ask it could not carry.
+type Encoded = { body: String, warnings: List[String] }
+
+// An answer as read so far. `finish` is the provider's own word ("" while it has not
+// said); `meter` is a cost the provider reported itself, in USD, or -1.0.
+type Folded = { content: String, reasoning: String, calls: List[ToolCall], finish: String, usage: core.Usage, meter: Float }
+
+fn empty() -> Folded = Folded { content: "", reasoning: "", calls: [], finish: "", usage: core.no_usage(), meter: -1.0 }
+
+// ── Reading JSON ──
+
+fn str_of(v: Value, key: String) -> String = json.get_string(v, key) ?? ""
+
+fn field_of(v: Value?, key: String) -> Value? = match v {
+  some(x) => match value.field(x, key) { ok(y) => some(y), err(_) => none },
+  none => none,
+}
+
+fn num(v: Value?, key: String) -> Int = match v {
+  some(u) => match json.get_int(u, key) { some(n) => n, none => float.to_int(json.get_float(u, key) ?? 0.0) },
+  none => 0,
+}
+
+// A count, or none when the field is not there at all.
+fn opt_num(v: Value?, key: String) -> Int? = match field_of(v, key) {
+  some(_) => some(num(v, key)),
+  none => none,
+}
+
+// Later wins for a count a provider repeats; a count it never gave stays unknown.
+fn later(a: Int?, b: Int?) -> Int? = match b { some(_) => b, none => a }
+
+fn merge_usage(a: core.Usage, b: core.Usage) -> core.Usage =
+  core.Usage { input: later(a.input, b.input), cache_read: later(a.cache_read, b.cache_read), cache_write: later(a.cache_write, b.cache_write),
+    output: later(a.output, b.output), reasoning: later(a.reasoning, b.reasoning) }
+
+// ── Reading a stream ──
+
+// The JSON payloads of a server-sent-event stream: its `data:` lines, `[DONE]` and blank
+// ones left out. A body that is not a stream at all is one payload.
+fn payloads(text: String) -> List[String] =
+  if not string.starts_with(string.trim_start(text), "data:") and not string.starts_with(string.trim_start(text), "event:") then
+    (if string.trim(text) == "" then [] else [text])
+  else list.filter(list.map(list.filter(string.split(text, "\n"), (l) => string.starts_with(l, "data:")), (l) => string.trim(string.drop(l, 5))),
+    (p) => p != "" and p != "[DONE]")
+
+// Only whole lines can be read; the last one may still be arriving.
+fn whole_lines(s: String) -> String = match string.last_index_of(s, "\n") { some(i) => string.take(s, i + 1), none => "" }
+
+// The name of the call a tool result answers, from the assistant message that made it.
+fn call_name(messages: List[Value], id: String) -> String = {
+  var name = "tool"
+  for m in messages {
+    for c in json.get_array(m, "tool_calls") ?? [] {
+      if str_of(c, "id") == id then { name = str_of(value.field(c, "function") ?? value.object([]), "name") } else ()
+    }
+  }
+  name
+}
+
+// A tool call's arguments as the object they encode; {} when they are not one.
+fn arguments_object(args: String) -> Value = match json.parse(if string.trim(args) == "" then "{}" else args) {
+  ok(v) => v,
+  err(_) => value.object([]),
+}
+
+// The system text of an OpenAI-shaped conversation: every system message, in order.
+fn system_of(messages: List[Value]) -> String =
+  string.join(list.map(list.filter(messages, (m) => str_of(m, "role") == "system"), (m) => str_of(m, "content")), "\n\n")
+
+// Reasoning budgets for the formats that take a token budget rather than a level.
+fn budget_for(effort: String) -> Int =
+  if effort == "low" or effort == "minimal" then 1024
+  else if effort == "medium" then 4096
+  else if effort == "high" then 16384
+  else if effort == "max" or effort == "xhigh" then 32768
+  else match int.parse(effort) { ok(n) => n, err(_) => 0 }
+
+test "a stream's payloads, and a body that is not one" {
+  assert_eq(payloads("event: a\ndata: {\"x\":1}\n\ndata: [DONE]\n"), ["{\"x\":1}"])
+  assert_eq(payloads("{\"choices\":[]}"), ["{\"choices\":[]}"])
+  assert_eq(payloads(""), [])
+  assert_eq(whole_lines("data: 1\ndata: 2"), "data: 1\n")
+}
+
+test "usage merges with the later count winning and the unreported staying unknown" {
+  let a = core.Usage { input: some(10), cache_read: none, cache_write: some(3), output: none, reasoning: none }
+  let b = core.Usage { input: none, cache_read: none, cache_write: none, output: some(7), reasoning: none }
+  let m = merge_usage(a, b)
+  assert_eq((m.input, m.cache_write, m.output, m.reasoning), (some(10), some(3), some(7), none))
+  assert_eq(budget_for("medium"), 4096)
+  assert_eq(budget_for("2500"), 2500)
+  assert_eq(budget_for(""), 0)
+}

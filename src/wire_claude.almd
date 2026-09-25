@@ -1,0 +1,177 @@
+// almai.wire_claude — Claude Code's `claude -p` as a model.
+//
+// Not an HTTP API, so there is no body to post and no stream to fold: the conversation
+// becomes a system prompt file, a prompt on stdin and a command line, and the answer is
+// the one JSON object claude prints at the end. almai.live runs the command; this module
+// is the pure part on either side of it, like the other wire_* formats.
+//
+// Claude Code as the model and nothing more: its own tools off (--tools ""), no settings,
+// hooks or MCP servers of the person's (--setting-sources "", --strict-mcp-config). Its
+// global CLAUDE.md and memory are still read: only --bare leaves them out, and --bare
+// takes an API key, not a Claude login.
+//
+// With a schema the answer comes through --json-schema. With tools it comes as one JSON
+// object written in the reply's text: through --json-schema the schema reaches the model
+// as a tool of its own, and a model holding one tool called the caller's tools as tools
+// too, got "No such tool available" for each and gave up -- 2 of 3 runs measured
+// 2026-09-25 (claude 2.1.282). With no tool at all, 3 of 3 answered in one turn.
+//
+// With `session` set, the session is continued with --resume, so a call sends only the
+// messages new since the last one; it starts over when there is none yet, when the
+// conversation got shorter, or when the model changed.
+
+import json
+import self.core as core
+import self.wire as wire
+import self.wire_anthropic as wire_anthropic
+
+let PROTOCOL = """
+How you act here: you are the model inside an agent that runs the actions listed below for you. You have no tools in this session. Reply with exactly one JSON object and nothing else, no code fence:
+{"content": "<words for the user>", "tool_calls": [{"name": "<action>", "arguments": {<its parameters>}}]}
+Put the actions you want in tool_calls; several independent ones can go in one reply. Their results come back as the next message. To answer the user, write the answer in content and leave tool_calls empty.
+"""
+
+type Session = { id: String, sent: Int, model: String }
+
+fn system(messages: List[Value], tools: List[Value]) -> String = {
+  let first = list.first(messages) ?? value.object([])
+  let given = if str_of(first, "role") == "system" then str_of(first, "content") else ""
+  if list.is_empty(tools) then (if given == "" then "Answer the request exactly as asked." else given)
+  else given + "\n" + PROTOCOL + "\nActions:\n" + string.join(list.map(tools, (t) => {
+    let f = value.field(t, "function") ?? value.object([])
+    "- " + str_of(f, "name") + ": " + str_of(f, "description") + "\n  parameters: " + json.stringify(value.field(f, "parameters") ?? value.object([]))
+  }), "\n")
+}
+
+// Messages from `from` on, as the text of one prompt. A continued session has its own
+// answers already, so they are left out; a fresh one gets the conversation so far. A
+// conversation of one user message is that message as it is.
+fn prompt(messages: List[Value], from: Int, fresh: Bool) -> String = {
+  let rest = list.drop(messages, from)
+  let users = list.filter(rest, (m) => str_of(m, "role") != "system")
+  if fresh and list.len(users) == 1 and str_of(list.first(users) ?? value.object([]), "role") == "user" then str_of(list.first(users) ?? value.object([]), "content")
+  else {
+    var parts: List[String] = []
+    for m in rest {
+      let role = str_of(m, "role")
+      if role == "user" then list.push(parts, (if fresh then "User: " else "") + str_of(m, "content"))
+      else if role == "tool" then list.push(parts, "Result of " + wire.call_name(messages, str_of(m, "tool_call_id")) + ":\n" + str_of(m, "content"))
+      else if role == "assistant" and fresh then {
+        let calls = list.map(json.get_array(m, "tool_calls") ?? [], (c) => {
+          let f = value.field(c, "function") ?? value.object([])
+          str_of(f, "name") + " " + str_of(f, "arguments")
+        })
+        list.push(parts, "You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + string.join(calls, "; ")))
+      } else ()
+    }
+    string.join(parts, "\n\n")
+  }
+}
+
+fn session_of(text: String) -> Session? = match json.parse(text) {
+  ok(v) => if str_of(v, "id") == "" then none else some(Session { id: str_of(v, "id"), sent: json.get_int(v, "sent") ?? 0, model: str_of(v, "model") }),
+  err(_) => none,
+}
+
+fn session_text(s: Session) -> String =
+  json.stringify(value.object([("id", value.str(s.id)), ("sent", value.int(s.sent)), ("model", value.str(s.model))]))
+
+fn continuing(s: Session?, message_count: Int, model: String) -> Session? = match s {
+  some(x) => if x.model == model and x.sent <= message_count and x.sent > 0 then some(x) else none,
+  none => none,
+}
+
+// The command line, as arguments to quote. `keep` keeps the session so it can be
+// continued; `resume` continues one, which already has its system prompt.
+fn args(model_id: String, resume: String, system_path: String, schema: Value?, keep: Bool) -> List[String] = {
+  var args = ["claude", "-p", "--output-format", "json", "--tools", "", "--setting-sources", "", "--strict-mcp-config"]
+  if not keep then { args = args + ["--no-session-persistence"] } else ()
+  match schema { some(sc) => { args = args + ["--json-schema", json.stringify(sc)] }, none => () }
+  if model_id != "" then { args = args + ["--model", model_id] } else ()
+  if resume != "" then { args = args + ["--resume", resume] } else { args = args + ["--system-prompt-file", system_path] }
+  args
+}
+
+// The JSON object in a reply's text, from the first "{" to the last "}".
+fn object_in(text: String) -> Value? =
+  match (string.index_of(text, "{"), string.last_index_of(text, "}")) {
+    (some(a), some(b)) => if b > a then (match json.parse(string.slice(text, a, b + 1)) { ok(v) => some(v), err(_) => none }) else none,
+    _ => none,
+  }
+
+// claude -p --output-format json prints one object: the answer in structured_output
+// (with a schema) or in result, or is_error with what went wrong. Read as the answer and
+// the session id; the cost claude reports is the meter.
+fn read(out: String, code: Int, said: String, tools: Bool) -> Result[(wire.Folded, String), core.LlmError] =
+  match json.parse(string.trim(out)) {
+    err(_) => err(if code == 127 then core.ErrConfig("claude is not installed (no `claude` on PATH)")
+      else if code == 143 or code == 137 then core.ErrCancelled
+      else core.ErrUnreadable("claude exit " + int.to_string(code) + ": " + string.take(if said == "" then string.trim(out) else said, 300))),
+    // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
+    ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
+      else {
+        let text = str_of(r, "result")
+        let (content, calls) = match value.field(r, "structured_output") {
+          ok(so) => (json.stringify(so), []),
+          err(_) => if not tools then (text, [])
+            else match object_in(text) {
+              some(v) => if option.is_some(json.get_array(v, "tool_calls")) or option.is_some(json.get_string(v, "content")) then
+                  (str_of(v, "content"), list.map(json.get_array(v, "tool_calls") ?? [], (c) =>
+                    wire.ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.field(c, "arguments") ?? value.object([])) }))
+                else (text, []),
+              none => (text, []),
+            },
+        }
+        ok((wire.Folded { content: content, reasoning: "", calls: calls, finish: str_of(r, "stop_reason"),
+          usage: wire_anthropic.usage_of(wire.field_of(some(r), "usage")), meter: json.get_float(r, "total_cost_usd") ?? -1.0 }, str_of(r, "session_id")))
+      },
+  }
+
+// What an Ask carries that claude -p cannot take.
+fn warnings(ask: wire.Ask) -> List[String] =
+  (if ask.effort != "" then ["claude -p takes no reasoning effort; \"" + ask.effort + "\" was not sent"] else [])
+    + (if option.is_some(ask.schema) and not list.is_empty(ask.tools) then ["with tools, claude -p answers as JSON text; the schema was not sent"] else [])
+
+fn str_of(v: Value, key: String) -> String = wire.str_of(v, key)
+
+test "claude gets the conversation once, then only what is new" {
+  let call = value.object([("id", value.str("c1")), ("type", value.str("function")),
+    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))])
+  let ms = [
+    value.object([("role", value.str("system")), ("content", value.str("sys"))]),
+    value.object([("role", value.str("user")), ("content", value.str("fix a.py"))]),
+    value.object([("role", value.str("assistant")), ("content", value.str("")), ("tool_calls", value.array([call]))]),
+    value.object([("role", value.str("tool")), ("tool_call_id", value.str("c1")), ("content", value.str("1 x = 1"))]),
+  ]
+  assert_eq(prompt(ms, 3, false), "Result of read:\n1 x = 1")
+  assert(string.starts_with(prompt(ms, 0, true), "User: fix a.py\n\nYou said: \nYou called: read"))
+  assert_eq(prompt(list.take(ms, 2), 0, true), "fix a.py")
+  let s = some(Session { id: "abc", sent: 4, model: "claude" })
+  assert_eq(continuing(s, 6, "claude"), s)
+  assert_eq(continuing(s, 2, "claude"), none)
+  assert_eq(session_of(session_text(Session { id: "abc", sent: 4, model: "claude" })), s)
+}
+
+test "claude's answer: the JSON in its text with tools, structured_output with a schema, plain words otherwise" {
+  let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.str("s1")),
+    ("result", value.str(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
+  match read(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true) {
+    ok((r, sid)) => { assert_eq(r.calls, [wire.ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(core.settled_finish(r.finish, not list.is_empty(r.calls)), core.FinishToolCalls) },
+    err(e) => assert_eq(core.error_text(e), ""),
+  }
+  match read(wrap("All tests pass."), 0, "", true) {
+    ok((r, _)) => { assert_eq(r.content, "All tests pass."); assert(list.is_empty(r.calls)) },
+    err(e) => assert_eq(core.error_text(e), ""),
+  }
+  let structured = "{\"is_error\":false,\"structured_output\":{\"edits\":[]},\"result\":\"\"}"
+  match read(structured, 0, "", false) {
+    ok((r, _)) => assert_eq(r.content, "{\"edits\":[]}"),
+    err(e) => assert_eq(core.error_text(e), ""),
+  }
+  assert(result.is_err(read("{\"is_error\":true,\"result\":\"Not logged in\"}", 1, "", true)))
+  assert_eq(read("", 127, "sh: claude: not found", true), err(core.ErrConfig("claude is not installed (no `claude` on PATH)")))
+  match read("{\"is_error\":true,\"result\":\"API Error: 529 {\\\"type\\\":\\\"overloaded_error\\\"}\"}", 1, "", true) {
+    err(e) => assert(core.retryable(e)),
+    ok(_) => assert(false),
+  }
+}
