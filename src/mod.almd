@@ -165,58 +165,52 @@ effect fn call(model_spec: String, msgs: List[Message]) -> Result[LLMResponse, S
 // SSE wrapper). Other providers fall back with an explicit error so the
 // caller can choose to retry via the non-streaming `call_with`.
 effect fn call_streaming(model_spec: String, msgs: List[Message], opts: CallOptions, on_text_delta: (String) -> Unit) -> Result[LLMResponse, String] = {
-  let parsed = parse_provider(model_spec)
-  let provider = parsed.0
-  let model = parsed.1
-  match provider {
-    "anthropic" => anthropic_provider.call_streaming(model, msgs, opts, on_text_delta),
-    "openai" => match require_env("OPENAI_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call_streaming("https://api.openai.com/v1", key, model, msgs, opts, on_text_delta)
+  let (provider, model) = parse_provider(model_spec)
+  if provider == "anthropic" then anthropic_provider.call_streaming(model, msgs, opts, on_text_delta)
+  else match compatible(provider) {
+    some((base, key_env)) => match require_env(key_env) {
+      ok(key) => openai_provider.call_streaming(base, key, model, msgs, opts, on_text_delta),
+      err(e) => err(e),
     },
-    "openrouter" => match require_env("OPENROUTER_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call_streaming("https://openrouter.ai/api/v1", key, model, msgs, opts, on_text_delta)
-    },
-    "groq" => match require_env("GROQ_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call_streaming("https://api.groq.com/openai/v1", key, model, msgs, opts, on_text_delta)
-    },
-    _ => err("call_streaming: provider '${provider}' does not support streaming yet (use call_with for non-streaming)")
+    none => err("call_streaming: provider '${provider}' does not support streaming yet (use call_with for non-streaming)"),
   }
 }
 
+// The OpenAI-compatible services: their base URL and the variable holding the key.
+let OPENAI_COMPATIBLE = [
+  ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+  ("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+  ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+]
+
+fn compatible(provider: String) -> (String, String)? =
+  option.map(list.find(OPENAI_COMPATIBLE, (c) => c.0 == provider), (c) => (c.1, c.2))
+
 effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
-  let parsed = parse_provider(model_spec)
-  let provider = parsed.0
-  let model = parsed.1
+  let (provider, model) = parse_provider(model_spec)
+  match compatible(provider) {
+    some((base, key_env)) => match require_env(key_env) {
+      ok(key) => openai_provider.call(base, key, model, msgs, opts),
+      err(e) => err(e),
+    },
+    none => call_native(provider, model, msgs, opts),
+  }
+}
+
+// The providers with an API of their own.
+effect fn call_native(provider: String, model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] =
   match provider {
     "anthropic" => anthropic_provider.call(model, msgs, opts),
-    "openai" => match require_env("OPENAI_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call("https://api.openai.com/v1", key, model, msgs, opts)
-    },
-    "openrouter" => match require_env("OPENROUTER_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call("https://openrouter.ai/api/v1", key, model, msgs, opts)
-    },
-    "groq" => match require_env("GROQ_API_KEY") {
-      err(e) => err(e)
-      ok(key) => openai_provider.call("https://api.groq.com/openai/v1", key, model, msgs, opts)
-    },
     "cf" => cf_provider.call(model, msgs, opts),
     "cloudflare" => cf_provider.call(model, msgs, opts),
     "azure" => azure_provider.call(model, msgs, opts),
     "bedrock" => bedrock_provider.call(model, msgs, opts),
     "google" => google_provider.call(model, msgs, opts),
-    "cli" => match model {
-      "claude" => cli_provider.call_claude(msgs, opts),
-      "codex" => cli_provider.call_codex(msgs, opts),
-      _ => err("unknown cli: " + model),
-    },
+    "cli" => if model == "claude" then cli_provider.call_claude(msgs, opts)
+      else if model == "codex" then cli_provider.call_codex(msgs, opts)
+      else err("unknown cli: " + model),
     _ => err("unknown provider: " + provider),
   }
-}
 
 // ── Retry support ──
 //
@@ -224,20 +218,10 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
 // dispatch in an exponential-backoff loop. Non-retriable errors (auth, malformed
 // request, etc.) propagate immediately. Pass `max_attempts: 1` for no retry.
 
-fn is_retriable_error(msg: String) -> Bool =
-  string.contains(msg, "408") or
-  string.contains(msg, "409") or
-  string.contains(msg, "429") or
-  string.contains(msg, "529") or
-  string.contains(msg, "overloaded") or
-  string.contains(msg, "500") or
-  string.contains(msg, "502") or
-  string.contains(msg, "503") or
-  string.contains(msg, "504") or
-  string.contains(msg, "timeout") or
-  string.contains(msg, "Timeout") or
-  string.contains(msg, "connection") or
-  string.contains(msg, "Connection")
+// What a transient failure's message contains.
+let RETRIABLE_MARKS = ["408", "409", "429", "529", "overloaded", "500", "502", "503", "504", "timeout", "Timeout", "connection", "Connection"]
+
+fn is_retriable_error(msg: String) -> Bool = list.any(RETRIABLE_MARKS, (m) => string.contains(msg, m))
 
 effect fn retry_loop(
   model_spec: String,
@@ -282,107 +266,3 @@ effect fn call_retry_with_delay(
 fn has_tool_calls(r: LLMResponse) -> Bool = not list.is_empty(r.tool_calls)
 fn first_tool_call(r: LLMResponse) -> Option[ToolCall] = list.first(r.tool_calls)
 fn parse_content_as_json(r: LLMResponse) -> Result[Value, String] = json.parse(r.content)
-
-// ── Tests ──
-
-test "parse_provider with slash" {
-  let p = parse_provider("anthropic/claude-sonnet-4-6")
-  assert_eq(p.0, "anthropic")
-  assert_eq(p.1, "claude-sonnet-4-6")
-}
-
-test "parse_provider no slash" {
-  let p = parse_provider("gpt-4o")
-  assert_eq(p.0, "openai")
-  assert_eq(p.1, "gpt-4o")
-}
-
-test "parse_provider cf" {
-  let p = parse_provider("cf/@cf/meta/llama")
-  assert_eq(p.0, "cf")
-  assert_eq(p.1, "@cf/meta/llama")
-}
-
-test "message constructors" {
-  assert_eq(system("s").role, "system")
-  assert_eq(user("u").role, "user")
-  assert_eq(assistant("a").role, "assistant")
-}
-
-test "defaults" {
-  let d = defaults()
-  assert_eq(d.max_tokens, 4096)
-  assert_eq(d.json_mode, false)
-}
-
-test "options builder" {
-  let opts = defaults() |> with_max_tokens(8192) |> with_system("sys") |> with_json_mode |> with_stop(["END"])
-  assert_eq(opts.max_tokens, 8192)
-  assert_eq(opts.system, "sys")
-  assert_eq(opts.json_mode, true)
-  assert_eq(list.len(opts.stop), 1)
-}
-
-test "with_seed / seed default" {
-  assert_eq(defaults().seed, 0)
-  assert_eq((defaults() |> with_seed(7)).seed, 7)
-}
-
-test "with_tools" {
-  let ts = [Tool { name: "f", description: "d", parameters: value.object([]) }]
-  assert_eq(list.len((defaults() |> with_tools(ts)).tools), 1)
-}
-
-test "has_tool_calls false" {
-  let r = LLMResponse { content: "hi", model: "m",
-    usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    finish_reason: "stop", tool_calls: [], sampling: Sampling { } }
-  assert_eq(has_tool_calls(r), false)
-}
-
-test "an unfilled sampling echo claims nothing" {
-  let s = Sampling { }
-  assert_eq(s.seed_sent, false)
-  assert_eq(s.temperature_sent, false)
-  assert_eq(s.top_p_sent, false)
-  assert_eq(s.max_tokens_sent, false)
-}
-
-test "is_retriable_error true for HTTP 429" {
-  assert(is_retriable_error("HTTP 429: too many requests"), "429")
-}
-
-test "is_retriable_error true for HTTP 503" {
-  assert(is_retriable_error("HTTP 503 Service Unavailable"), "503")
-}
-
-test "is_retriable_error true for timeout" {
-  assert(is_retriable_error("request timeout after 30s"), "timeout")
-  assert(is_retriable_error("Timeout reached"), "Timeout")
-}
-
-test "is_retriable_error false for auth errors" {
-  assert(not is_retriable_error("HTTP 401 Unauthorized"), "401")
-  assert(not is_retriable_error("HTTP 403 Forbidden"), "403")
-  assert(not is_retriable_error("HTTP 400 Bad Request"), "400")
-}
-
-test "is_retriable_error false for missing env" {
-  assert(not is_retriable_error("missing env: OPENAI_API_KEY"), "missing env")
-}
-
-test "parse_content_as_json" {
-  let r = LLMResponse { content: "{\"x\":1}", model: "m",
-    usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    finish_reason: "stop", tool_calls: [], sampling: Sampling { } }
-  match parse_content_as_json(r) {
-    ok(v) => assert_eq(json.get_int(v, "x") |> option.unwrap_or(0), 1)
-    err(_) => assert(false)
-  }
-}
-
-test "is_retriable_error true for 408, 409, 529 and an overloaded provider" {
-  assert(is_retriable_error("HTTP 408: request timeout"))
-  assert(is_retriable_error("HTTP 409: conflict"))
-  assert(is_retriable_error("HTTP 529: {\"type\":\"overloaded_error\"}"))
-}

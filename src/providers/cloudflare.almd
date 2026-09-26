@@ -238,29 +238,18 @@ fn api_complaint(parsed: Value, raw: String) -> String = {
   else "no errors[] either; body starts: " + string.slice(string.trim(raw), 0, 300)
 }
 
-effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] =
-  match resolve_account() {
-    err(e) => err(e)
-    ok(account_id) => match require_env("CLOUDFLARE_API_KEY") {
-      err(e) => err(e)
-      ok(api_key) => match require_env("CLOUDFLARE_EMAIL") {
-        err(_) => err("cloudflare: need CLOUDFLARE_EMAIL for Global API Key auth")
-        ok(email) => {
-          let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
-          let body = json.stringify(build_body(msgs, opts))
-          match http.request("POST", url, body, ["X-Auth-Key": api_key, "X-Auth-Email": email, "Content-Type": "application/json"]) {
-            err(e) => err("cloudflare: http: " + e)
-            ok(raw) => match json.parse(raw) {
-              err(e) => err("cloudflare: json: " + e)
-              ok(parsed) => match completion_text(parsed) {
-                none => err("cloudflare: no completion for model '" + model + "'; " + api_complaint(parsed, raw))
-                some(content) => ok(LLMResponse { content: string.trim(content), model: model,
-                  usage: usage_of(parsed),
-                  finish_reason: finish_reason_of(parsed), tool_calls: [], sampling: sampling_of(opts) })
-              }
-            }
-          }
-        }
-      }
-    }
+effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let account_id = resolve_account()!
+  let api_key = require_env("CLOUDFLARE_API_KEY")!
+  let email = require_env("CLOUDFLARE_EMAIL") |> result.map_err((_) => "cloudflare: need CLOUDFLARE_EMAIL for Global API Key auth")!
+  let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
+  let body = json.stringify(build_body(msgs, opts))
+  let raw = http.request("POST", url, body, ["X-Auth-Key": api_key, "X-Auth-Email": email, "Content-Type": "application/json"])
+    |> result.map_err((e) => "cloudflare: http: " + e)!
+  let parsed = json.parse(raw) |> result.map_err((e) => "cloudflare: json: " + e)!
+  match completion_text(parsed) {
+    none => err("cloudflare: no completion for model '" + model + "'; " + api_complaint(parsed, raw)),
+    some(content) => ok(LLMResponse { content: string.trim(content), model: model, usage: usage_of(parsed),
+      finish_reason: finish_reason_of(parsed), tool_calls: [], sampling: sampling_of(opts) }),
   }
+}

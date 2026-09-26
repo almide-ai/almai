@@ -1,0 +1,77 @@
+// Tests of almai.live (src/live.almd).
+
+import env
+import fs
+import process
+import self.core as core
+import self.route as route
+import self.wire as wire
+import self.live as live
+
+
+test "each endpoint's format gets the request, and its answer is read back the same way" {
+  let req = live.Request { model: "m", messages: [value.object([("role", value.str("system")), ("content", value.str("sys"))])], max_tokens: 100 }
+  let ep = (kind: String, p: String) => route.Endpoint { kind: kind, provider: p, url: "", headers: [], model_id: "m" }
+  assert(string.contains(live.encode(ep("chat", "cf"), req).body, "\"max_completion_tokens\":100"))
+  assert(string.contains(live.encode(ep("anthropic", "anthropic"), req).body, "\"system\":\"sys\""))
+  assert(string.contains(live.encode(ep("gemini", "gemini"), req).body, "\"systemInstruction\""))
+  let anthropic = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n"
+    + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n"
+  assert_eq(option.map(result.to_option(live.fold_as("anthropic", false, anthropic)), (f) => f.content), some("hi"))
+  assert_eq(option.map(result.to_option(live.fold_as("gemini", false, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n")), (f) => f.content), some("hi"))
+}
+
+test "the cost is the provider's meter, else the price table, else not known" {
+  let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
+  let f = live.fold_as("chat", false, sse) ?? wire.empty()
+  let r = live.reply_of(f, route.Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
+  assert_eq((r.usage.input, r.usage.cache_read, r.usage.output), (some(60), some(40), some(20)))
+  assert_eq((r.finish, r.raw_finish), (core.FinishToolCalls, "tool_calls"))
+  assert(r.cost.usd > 0.0 and r.cost.source == "table")
+  let metered = wire.Folded { content: "", reasoning: "", calls: [], finish: "stop", usage: core.no_usage(), meter: 0.25 }
+  assert_eq(live.reply_of(metered, route.Endpoint { kind: "chat", provider: "openrouter", url: "", headers: [], model_id: "x" }, 1, []).cost, core.Cost { usd: 0.25, source: "provider" })
+  assert_eq(live.reply_of(wire.empty(), route.Endpoint { kind: "anthropic", provider: "anthropic", url: "", headers: [], model_id: "x" }, 1, []).cost.source, "none")
+}
+
+test "a request is done only once the shell has written the exit status" {
+  assert_eq(live.exit_of("200"), none)
+  assert_eq(live.exit_of("200\n0\n"), some((200, 0)))
+  assert_eq(live.exit_of("000\n28\n"), some((0, 28)))
+}
+
+test "a finished request is read: curl's exit, then the status, then the stream" {
+  let p = live.Pending { sh_pid: 0, pid_file: "", stream: "", cfg: "", body: "", out: "", err: "", headers: "", t0: 0, model: "", kind: "chat",
+    session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] }
+  assert(match live.read_http(p, 0, 28, "", "", 0) { err(core.ErrTimeout(_)) => true, _ => false })
+  assert(match live.read_http(p, 0, 6, "", "Could not resolve host", 0) { err(core.ErrTransport(m)) => string.contains(m, "curl exit 6"), _ => false })
+  assert_eq(live.read_http(p, 429, 0, "slow down", "", 3000), err(core.ErrRateLimited(3000, "slow down")))
+  assert(match live.read_http(p, 200, 0, "", "", 0) { err(core.ErrTruncated(_)) => true, _ => false })
+  match live.read_http(p, 200, 0, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", "", 0) {
+    ok((f, cut_short)) => { assert_eq(f.content, "hi"); assert_eq(list.len(cut_short), 1) },
+    err(e) => assert_eq(core.error_text(e), ""),
+  }
+  assert(match live.read_http(p, 200, 0, "data: {\"error\":{\"message\":\"overloaded\"}}\n", "", 0) { err(e) => core.retryable(e), _ => false })
+}
+
+// The stop path is the one that leaks money: a request whose program outlives the shell
+// keeps streaming an answer nobody will read, and keeps being billed for it. What
+// matters is not which pid dies but that the work stops, so the child here keeps
+// writing and the test watches the writing stop. (Kept from golemide, where it was
+// written for its hedge.)
+test "cancel stops the work the request spawned, not only its shell" {
+  let sink = fs.create_temp_file("almai-test-sink")!
+  let pid_file = fs.create_temp_file("almai-test-pid")!
+  let script = "( while true; do echo x >> " + live.sh_quote(sink) + "; sleep 0.05; done ) & c=$!; echo $c > " + live.sh_quote(pid_file) + "; wait $c"
+  let shell_pid = process.spawn("sh", ["-c", script])!
+  env.sleep_ms(400)
+  assert(string.len(fs.read_text(sink) ?? "") > 0)
+  // `sink` is not one of the paths live.cancel removes: the child would recreate it on the
+  // next append, which would hide the very thing measured.
+  let scratch = fs.create_temp_file("almai-test-scratch")!
+  live.cancel(live.Pending { sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
+    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] })!
+  env.sleep_ms(400)
+  let just_after = string.len(fs.read_text(sink) ?? "")
+  env.sleep_ms(400)
+  assert_eq(string.len(fs.read_text(sink) ?? ""), just_after)
+}

@@ -1,46 +1,24 @@
 // almai.live — a model call you can watch, stop, and bound in time.
 //
-// `almai.call_with` blocks until the answer is in, with no deadline and no way to stop
-// it. An agent needs more: to show the answer while it is being written, to stop it when
-// the person presses Esc, to give up on a stream that has gone quiet, and to start a
-// second copy of a request that is not arriving. This module does that for the
-// OpenAI-compatible services, Anthropic, Gemini, and Claude Code's `claude -p`:
+// An agent needs more than a call that blocks: to show the answer while it is written,
+// to stop it on Esc, to give up on a stream gone quiet, and to start a second copy of a
+// request that is not arriving. `start` / `is_done` / `text_so_far` / `cancel` /
+// `finish` do that step by step; `run(req, limits, hedge_ms, cap_ms)` all at once.
 //
-//   let p = live.start(live.Request { model: "cf/glm-5.3", messages: ms, ... }, live.limits())!
-//   while not live.is_done(p)! { show(live.text_so_far(p)!); env.sleep_ms(250) }
-//   let r = live.finish(p)!          // or live.cancel(p)! to stop it
+// The request runs in the background (curl, or claude -p), writing to files, so it can
+// be read while it arrives and killed at any point, and curl bounds it: `max-time` for
+// the whole request, `speed-limit`/`speed-time` for a stream that stops talking. Every
+// chat request is streamed: a non-streamed Cloudflare request past about four minutes
+// is ended with `408`. Credentials go in curl's config file, never on a command line.
 //
-// or, all at once, with a wall-clock cap and a hedge: `live.run(req, limits, hedge_ms, cap_ms)`.
-//
-// The request runs in the background (curl, or claude), writing to files, so it can be
-// read while it arrives and killed at any point, and curl bounds it: `max-time` for the
-// whole request, `speed-limit`/`speed-time` for a stream that stops talking. Measured
-// in golemide: a non-streamed Cloudflare request past about four minutes is ended by the
-// provider with `408 Request timeout`, so every chat request here is streamed; and the
-// credentials go in curl's config file, never on a command line where `ps` shows them.
-//
-// Model ids are PROVIDER/MODEL or PROVIDER:MODEL, split at the first of the two:
-//
-//   cf/glm-5.3, cf:glm-5.3-flash, cf/@cf/...   Cloudflare Workers AI
-//                  (CLOUDFLARE_ACCOUNT_ID or CF_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN,
-//                   or CLOUDFLARE_EMAIL with CLOUDFLARE_API_KEY)
-//   openai/, openrouter/, deepseek/, zai/, groq/  that OpenAI-compatible service, NAME_API_KEY
-//   ollama/, lmstudio/                         a local server, no key
-//   anthropic/MODEL                            Anthropic's Messages API, ANTHROPIC_API_KEY
-//                                              (ANTHROPIC_BASE_URL to send it elsewhere)
-//   gemini/MODEL, google/MODEL                 Gemini, GEMINI_API_KEY or GOOGLE_API_KEY
-//                                              (GEMINI_BASE_URL to send it elsewhere)
-//   NAME/MODEL                                 any other: NAME_BASE_URL and NAME_API_KEY
-//   claude, claude/opus, cli/claude            Claude Code's claude -p, on its own login
-//
-// The formats themselves -- the request each API takes and how its stream reads -- are
-// pure functions in almai.wire_openai, wire_anthropic and wire_gemini, and claude -p's
-// prompt, command line and reply in wire_claude; this module runs them. The messages and tools are always in the OpenAI chat shape, whatever the model.
+// Where a model id goes is almai.route; the formats themselves are the pure wire_*
+// modules. Messages and tools are in the OpenAI chat shape, whatever the model.
 
 import env
 import fs
 import process
 import self.core as core
+import self.route as route
 import self.wire as wire
 import self.wire_openai as wire_openai
 import self.wire_anthropic as wire_anthropic
@@ -48,11 +26,6 @@ import self.wire_gemini as wire_gemini
 import self.wire_claude as wire_claude
 
 // ── Types ──
-
-// `kind` is the format spoken: "chat" (OpenAI-compatible), "anthropic", "gemini", or
-// "claude" (claude -p). `headers` carry the
-// credentials, and so are only ever written to curl's config file.
-type Endpoint = { kind: String, provider: String, url: String, headers: List[String], model_id: String }
 
 // `messages` and `tools` are in the OpenAI chat-completions shape. `effort` is the
 // reasoning effort, sent where the service takes it ("" sends none). `schema`, when
@@ -86,117 +59,17 @@ fn limits() -> Limits = Limits { total_s: 900, idle_s: 120 }
 type Pending = { sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String, headers: String,
   t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, schema_tool: Bool, warnings: List[String] }
 
-// ── Model ids ──
+// Where a model id goes lives in almai.route; these keep the names callers use.
+fn split_model(spec: String) -> (String, String) = route.split_model(spec)
 
-// (provider, model), split at the first "/" or ":". A bare name is Cloudflare's, as is
-// an @cf/ id; "cli/claude" is claude.
-fn split_model(spec: String) -> (String, String) = {
-  let slash = string.index_of(spec, "/") ?? -1
-  let colon = string.index_of(spec, ":") ?? -1
-  let at = if slash < 0 then colon else if colon < 0 then slash else int.min(slash, colon)
-  if spec == "claude" or spec == "cli/claude" then ("claude", "")
-  else if string.starts_with(spec, "@cf/") then ("cf", spec)
-  else if at < 0 then ("cf", spec)
-  else (string.to_lower(string.take(spec, at)), string.drop(spec, at + 1))
-}
-
-type Price = { input: Float, output: Float, cached: Float }  // USD per Mtok
-
-// Cloudflare's short names, their ids and prices (per Mtok, 2026-09).
-let CF_MODELS = [
-  ("glm-5.3-flash", "@cf/zai-org/glm-5.3-flash", Price { input: 0.15, output: 0.5, cached: 0.03 }),
-  ("glm-5.3", "@cf/zai-org/glm-5.3", Price { input: 1.4, output: 4.4, cached: 0.26 }),
-  ("deepseek-v4-flash-0731", "@cf/deepseek-ai/deepseek-v4-flash-0731", Price { input: 0.44, output: 1.32, cached: 0.014 }),
-  ("gemma-4-26b", "@cf/google/gemma-4-26b-a4b-it", Price { input: 0.1, output: 0.3, cached: 0.1 }),
-]
-
-fn cf_id_of(short: String) -> String = match list.find(CF_MODELS, (m) => m.0 == short) {
-  some(m) => m.1,
-  none => if string.starts_with(short, "@cf/") then short else "@cf/" + short,
-}
-
-fn price_of(ep: Endpoint) -> Price? =
-  if ep.provider != "cf" then none
-  else option.map(list.find(CF_MODELS, (m) => m.1 == ep.model_id), (m) => m.2)
-
-fn known_base(provider: String) -> String =
-  if provider == "openai" then "https://api.openai.com/v1"
-  else if provider == "openrouter" then "https://openrouter.ai/api/v1"
-  else if provider == "deepseek" then "https://api.deepseek.com/v1"
-  else if provider == "zai" then "https://api.z.ai/api/paas/v4"
-  else if provider == "groq" then "https://api.groq.com/openai/v1"
-  else if provider == "ollama" then "http://localhost:11434/v1"
-  else if provider == "lmstudio" then "http://localhost:1234/v1"
-  else ""
-
-fn keyless(provider: String) -> Bool = provider == "ollama" or provider == "lmstudio"
-
-fn env_name(provider: String) -> String = string.to_upper(string.replace(provider, "-", "_"))
-
-effect fn env_of(key: String) -> String = string.trim(env.get(key) ?? "")
-
-// The first of these variables that is set, or "".
-effect fn first_env(keys: List[String]) -> String = {
-  var found = ""
-  for k in keys { if found == "" then { found = env_of(k)! } else () }
-  found
-}
-
-fn no_slash(base: String) -> String = string.strip_suffix(base, "/") ?? base
-
-fn cloudflare_endpoint(spec: String, model: String, account: String, token: String, email: String, key: String) -> Result[Endpoint, String] = {
-  let headers = if token != "" then ["Authorization: Bearer " + token]
-    else if email != "" and key != "" then ["X-Auth-Email: " + email, "X-Auth-Key: " + key] else []
-  if account == "" or list.is_empty(headers) then err("no Cloudflare credentials for " + spec + ": set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
-  else ok(Endpoint { kind: "chat", provider: "cf", url: "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/v1/chat/completions",
-    headers: headers, model_id: cf_id_of(model) })
-}
-
-fn anthropic_endpoint(spec: String, model: String, key: String, base: String) -> Result[Endpoint, String] =
-  if key == "" then err("no ANTHROPIC_API_KEY for " + spec)
-  else ok(Endpoint { kind: "anthropic", provider: "anthropic", url: no_slash(if base == "" then "https://api.anthropic.com" else base) + "/v1/messages",
-    headers: ["x-api-key: " + key, "anthropic-version: 2023-06-01"], model_id: model })
-
-fn gemini_endpoint(spec: String, model: String, key: String, base: String) -> Result[Endpoint, String] =
-  if key == "" then err("no GEMINI_API_KEY (or GOOGLE_API_KEY) for " + spec)
-  else ok(Endpoint { kind: "gemini", provider: "gemini",
-    url: no_slash(if base == "" then "https://generativelanguage.googleapis.com/v1beta" else base) + "/models/" + model + ":streamGenerateContent?alt=sse",
-    headers: ["x-goog-api-key: " + key], model_id: model })
-
-// Any OpenAI-compatible service: a known one, or NAME_BASE_URL.
-fn chat_endpoint(spec: String, provider: String, model: String, key: String, base: String) -> Result[Endpoint, String] = {
-  let name = env_name(provider)
-  let url = if base == "" then known_base(provider) else base
-  if url == "" then err("unknown provider " + provider + ": set " + name + "_BASE_URL (and " + name + "_API_KEY) to an OpenAI-compatible endpoint")
-  else if key == "" and not keyless(provider) then err("no " + name + "_API_KEY for " + spec)
-  else ok(Endpoint { kind: "chat", provider: provider, url: no_slash(url) + "/chat/completions",
-    headers: if key == "" then [] else ["Authorization: Bearer " + key], model_id: model })
-}
-
-// Where a model id goes, and as whom. Values are never printed; a missing one is named.
-effect fn endpoint(spec: String) -> Result[Endpoint, String] = {
-  let (provider, model) = split_model(spec)
-  if provider == "claude" or provider == "cli" then
-    (if provider == "cli" and model != "claude" then err("unknown cli: " + model)
-    else ok(Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: model }))
-  else if provider == "cf" or provider == "cloudflare" then
-    cloudflare_endpoint(spec, model, first_env(["CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID"])!, env_of("CLOUDFLARE_API_TOKEN")!,
-      env_of("CLOUDFLARE_EMAIL")!, env_of("CLOUDFLARE_API_KEY")!)
-  else if provider == "anthropic" then anthropic_endpoint(spec, model, env_of("ANTHROPIC_API_KEY")!, env_of("ANTHROPIC_BASE_URL")!)
-  else if provider == "gemini" or provider == "google" then
-    gemini_endpoint(spec, model, first_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])!, env_of("GEMINI_BASE_URL")!)
-  else {
-    let name = env_name(provider)
-    chat_endpoint(spec, provider, model, env_of(name + "_API_KEY")!, env_of(name + "_BASE_URL")!)
-  }
-}
+effect fn endpoint(spec: String) -> Result[route.Endpoint, String] = route.endpoint(spec)
 
 // ── The request ──
 
-fn ask_of(ep: Endpoint, req: Request) -> wire.Ask =
+fn ask_of(ep: route.Endpoint, req: Request) -> wire.Ask =
   wire.Ask { model_id: ep.model_id, provider: ep.provider, messages: req.messages, tools: req.tools, max_tokens: req.max_tokens, effort: req.effort, schema: req.schema }
 
-fn encode(ep: Endpoint, req: Request) -> wire.Encoded =
+fn encode(ep: route.Endpoint, req: Request) -> wire.Encoded =
   if ep.kind == "anthropic" then wire_anthropic.encode(ask_of(ep, req))
   else if ep.kind == "gemini" then wire_gemini.encode(ask_of(ep, req))
   else wire_openai.encode(ask_of(ep, req))
@@ -210,37 +83,19 @@ fn fold_as(kind: String, schema_tool: Bool, text: String) -> Result[wire.Folded,
 fn quoted(s: String) -> String = "\"" + string.replace(string.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
 
 // The response headers go to `headers_path`: Retry-After lives there.
-fn curl_config(ep: Endpoint, body_path: String, stream_path: String, headers_path: String, l: Limits) -> String = {
-  var lines = ["url = " + quoted(ep.url), "request = \"POST\"", "header = \"Content-Type: application/json\""]
-  for h in ep.headers { list.push(lines, "header = " + quoted(h)) }
-  list.push(lines, "data = " + quoted("@" + body_path))
-  list.push(lines, "output = " + quoted(stream_path))
-  list.push(lines, "dump-header = " + quoted(headers_path))
-  list.push(lines, "max-time = " + int.to_string(l.total_s))
-  list.push(lines, "speed-limit = 1")
-  list.push(lines, "speed-time = " + int.to_string(l.idle_s))
-  list.push(lines, "silent")
-  list.push(lines, "show-error")
-  list.push(lines, "no-buffer")
-  list.push(lines, "write-out = \"%{http_code}\"")
-  string.join(lines, "\n") + "\n"
-}
+fn curl_config(ep: route.Endpoint, body_path: String, stream_path: String, headers_path: String, l: Limits) -> String =
+  string.join(["url = " + quoted(ep.url), "request = \"POST\"", "header = \"Content-Type: application/json\""]
+    + list.map(ep.headers, (h) => "header = " + quoted(h))
+    + ["data = " + quoted("@" + body_path), "output = " + quoted(stream_path), "dump-header = " + quoted(headers_path),
+      "max-time = " + int.to_string(l.total_s), "speed-limit = 1", "speed-time = " + int.to_string(l.idle_s),
+      "silent", "show-error", "no-buffer", "write-out = \"%{http_code}\""], "\n") + "\n"
 
 // ── The answer ──
 
-// The provider's own meter first; then the price table; else not known.
-fn cost_of(f: wire.Folded, ep: Endpoint) -> core.Cost =
-  if f.meter >= 0.0 then core.Cost { usd: f.meter, source: "provider" }
-  else match price_of(ep) {
-    some(p) => core.Cost { usd: (float.from_int(core.count(f.usage.input)) * p.input + float.from_int(core.count(f.usage.cache_read)) * p.cached
-      + float.from_int(core.count(f.usage.output)) * p.output) / 1000000.0, source: "table" },
-    none => core.no_cost(),
-  }
-
-fn reply_of(f: wire.Folded, ep: Endpoint, ms: Int, warnings: List[String]) -> Reply = {
+fn reply_of(f: wire.Folded, ep: route.Endpoint, ms: Int, warnings: List[String]) -> Reply = {
   let calls = list.map(list.filter(f.calls, (c) => c.name != ""), (c) => ToolCall { id: c.id, name: c.name, arguments: c.arguments })
   Reply { content: f.content, reasoning: f.reasoning, calls: calls, finish: core.settled_finish(f.finish, not list.is_empty(calls)), raw_finish: f.finish,
-    usage: f.usage, cost: cost_of(f, ep), warnings: warnings, ms: ms }
+    usage: f.usage, cost: route.cost_of(f.meter, f.usage, ep), warnings: warnings, ms: ms }
 }
 
 // ── In flight ──
@@ -320,10 +175,10 @@ effect fn clean_up(p: Pending) -> Unit = {
 // Stop it: the program first, then the shell waiting on it.
 effect fn cancel(p: Pending) -> Unit = {
   match int.parse(string.trim(fs.read_text(p.pid_file) ?? "")) {
-    ok(pid) => if process.is_alive(pid) then { let _ = process.kill(pid, 15); () } else (),
+    ok(pid) => if process.is_alive(pid) then { let _ = process.kill(pid, 15); () },
     err(_) => (),
   }
-  if process.is_alive(p.sh_pid) then { let _ = process.kill(p.sh_pid, 15); () } else ()
+  if process.is_alive(p.sh_pid) then { let _ = process.kill(p.sh_pid, 15); () }
   clean_up(p)!
 }
 
@@ -341,7 +196,7 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
   let _ = clean_up(p)
   if p.kind == "claude" then finish_claude(p, text, code, said, ms)
   else match read_http(p, status, code, text, said, core.retry_after_in(headers)) {
-    ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
+    ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? route.Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
       p.warnings + cut_short)),
     err(e) => err(e),
   }
@@ -351,8 +206,8 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
 effect fn finish_claude(p: Pending, text: String, code: Int, said: String, ms: Int) -> Result[Reply, core.LlmError] =
   match wire_claude.read(text, code, said, p.tools) {
     ok((f, sid)) => {
-      if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () } else ()
-      ok(reply_of(f, Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
+      if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () }
+      ok(reply_of(f, route.Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
     },
     err(e) => err(e),
   }
@@ -361,11 +216,20 @@ effect fn finish_claude(p: Pending, text: String, code: Int, said: String, ms: I
 // then the stream. The answer comes with a warning when the stream ended without
 // saying why.
 fn read_http(p: Pending, status: Int, code: Int, text: String, said: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
-  if code == 28 then err(core.ErrTimeout("no answer within " + int.to_string(p.limits.total_s) + "s, or nothing for " + int.to_string(p.limits.idle_s) + "s"))
-  else if code == 143 or code == 137 then err(core.ErrCancelled)
-  else if code != 0 then err(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
-  else if status < 200 or status >= 300 then err(core.classify(status, text, retry_after_ms))
-  else match fold_as(p.kind, p.schema_tool, text) {
+  match curl_failure(code, said, p.limits) {
+    some(e) => err(e),
+    none => if status < 200 or status >= 300 then err(core.classify(status, text, retry_after_ms)) else read_stream(p, text, retry_after_ms),
+  }
+
+// curl's own exit codes: 28 is a deadline, 143 and 137 a kill.
+fn curl_failure(code: Int, said: String, l: Limits) -> core.LlmError? =
+  if code == 0 then none
+  else if code == 28 then some(core.ErrTimeout("no answer within " + int.to_string(l.total_s) + "s, or nothing for " + int.to_string(l.idle_s) + "s"))
+  else if code == 143 or code == 137 then some(core.ErrCancelled)
+  else some(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
+
+fn read_stream(p: Pending, text: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
+  match fold_as(p.kind, p.schema_tool, text) {
     // An error sent inside the stream, after a 200: read like a failed reply's body.
     err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, retry_after_ms) else core.ErrUnreadable(e)),
     ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
@@ -390,19 +254,7 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
   let hard = (l.total_s + 30) * 1000
   let deadline = if cap_ms > 0 then int.min(cap_ms, hard) else hard
   let first = start(req, l)!
-  let hedge_at = if first.kind == "claude" then 0 else hedge_ms
-  var second: Pending? = none
-  var winner: Pending? = none
-  var timed_out = false
-  while option.is_none(winner) and not timed_out {
-    let waited = env.millis() - t0
-    if is_done(first) ?? false then { winner = some(first) }
-    else match second {
-      some(s) => if is_done(s) ?? false then { winner = some(s) } else (),
-      none => if hedge_at > 0 and waited > hedge_at then { second = some(start(req, l)!) } else (),
-    }
-    if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) } else ()
-  }
+  let (winner, second) = race(req, l, first, if first.kind == "claude" then 0 else hedge_ms, t0, deadline)!
   let started = match second { some(s) => [first, s], none => [first] }
   match winner {
     none => {
@@ -417,90 +269,29 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
   }
 }
 
+// Poll until a copy is done, starting the second one past `hedge_at` (0: never): the
+// copy that finished, if any did before the deadline, and the second, if it started.
+effect fn race(req: Request, l: Limits, first: Pending, hedge_at: Int, t0: Int, deadline: Int) -> Result[(Pending?, Pending?), core.LlmError] = {
+  var second: Pending? = none
+  var winner: Pending? = none
+  var timed_out = false
+  while option.is_none(winner) and not timed_out {
+    let waited = env.millis() - t0
+    winner = done_of(first, second) ?? none
+    if option.is_none(winner) and option.is_none(second) and hedge_at > 0 and waited > hedge_at then { second = some(start(req, l)!) }
+    if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) }
+  }
+  ok((winner, second))
+}
+
+effect fn done_of(first: Pending, second: Pending?) -> Pending? =
+  if is_done(first) ?? false then some(first)
+  else match second {
+    some(s) => if is_done(s) ?? false then some(s) else none,
+    none => none,
+  }
+
 effect fn cancel_all(ps: List[Pending]) -> Unit = {
   for p in ps { cancel(p)! }
   ()
-}
-
-// ── Tests ──
-
-test "a model id splits at the first / or :" {
-  assert_eq(split_model("cf/glm-5.3"), ("cf", "glm-5.3"))
-  assert_eq(split_model("cf:glm-5.3-flash"), ("cf", "glm-5.3-flash"))
-  assert_eq(split_model("glm-5.3"), ("cf", "glm-5.3"))
-  assert_eq(split_model("@cf/zai-org/glm-5.3"), ("cf", "@cf/zai-org/glm-5.3"))
-  assert_eq(split_model("cf/@cf/zai-org/glm-5.3"), ("cf", "@cf/zai-org/glm-5.3"))
-  assert_eq(split_model("openrouter/anthropic/claude-sonnet-4"), ("openrouter", "anthropic/claude-sonnet-4"))
-  assert_eq(split_model("ollama:qwen3:8b"), ("ollama", "qwen3:8b"))
-  assert_eq(split_model("claude"), ("claude", ""))
-  assert_eq(split_model("cli/claude"), ("claude", ""))
-  assert_eq(split_model("claude:opus"), ("claude", "opus"))
-  assert_eq(cf_id_of("glm-5.3"), "@cf/zai-org/glm-5.3")
-}
-
-test "each endpoint's format gets the request, and its answer is read back the same way" {
-  let req = Request { model: "m", messages: [value.object([("role", value.str("system")), ("content", value.str("sys"))])], max_tokens: 100 }
-  let ep = (kind: String, p: String) => Endpoint { kind: kind, provider: p, url: "", headers: [], model_id: "m" }
-  assert(string.contains(encode(ep("chat", "cf"), req).body, "\"max_completion_tokens\":100"))
-  assert(string.contains(encode(ep("anthropic", "anthropic"), req).body, "\"system\":\"sys\""))
-  assert(string.contains(encode(ep("gemini", "gemini"), req).body, "\"systemInstruction\""))
-  let anthropic = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n"
-    + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n"
-  assert_eq(option.map(result.to_option(fold_as("anthropic", false, anthropic)), (f) => f.content), some("hi"))
-  assert_eq(option.map(result.to_option(fold_as("gemini", false, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n")), (f) => f.content), some("hi"))
-}
-
-test "the cost is the provider's meter, else the price table, else not known" {
-  let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
-  let f = fold_as("chat", false, sse) ?? wire.empty()
-  let r = reply_of(f, Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
-  assert_eq((r.usage.input, r.usage.cache_read, r.usage.output), (some(60), some(40), some(20)))
-  assert_eq((r.finish, r.raw_finish), (core.FinishToolCalls, "tool_calls"))
-  assert(r.cost.usd > 0.0 and r.cost.source == "table")
-  let metered = wire.Folded { content: "", reasoning: "", calls: [], finish: "stop", usage: core.no_usage(), meter: 0.25 }
-  assert_eq(reply_of(metered, Endpoint { kind: "chat", provider: "openrouter", url: "", headers: [], model_id: "x" }, 1, []).cost, core.Cost { usd: 0.25, source: "provider" })
-  assert_eq(reply_of(wire.empty(), Endpoint { kind: "anthropic", provider: "anthropic", url: "", headers: [], model_id: "x" }, 1, []).cost.source, "none")
-}
-
-test "a request is done only once the shell has written the exit status" {
-  assert_eq(exit_of("200"), none)
-  assert_eq(exit_of("200\n0\n"), some((200, 0)))
-  assert_eq(exit_of("000\n28\n"), some((0, 28)))
-}
-
-test "a finished request is read: curl's exit, then the status, then the stream" {
-  let p = Pending { sh_pid: 0, pid_file: "", stream: "", cfg: "", body: "", out: "", err: "", headers: "", t0: 0, model: "", kind: "chat",
-    session: "", sent: 0, limits: limits(), tools: false, schema_tool: false, warnings: [] }
-  assert(match read_http(p, 0, 28, "", "", 0) { err(core.ErrTimeout(_)) => true, _ => false })
-  assert(match read_http(p, 0, 6, "", "Could not resolve host", 0) { err(core.ErrTransport(m)) => string.contains(m, "curl exit 6"), _ => false })
-  assert_eq(read_http(p, 429, 0, "slow down", "", 3000), err(core.ErrRateLimited(3000, "slow down")))
-  assert(match read_http(p, 200, 0, "", "", 0) { err(core.ErrTruncated(_)) => true, _ => false })
-  match read_http(p, 200, 0, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", "", 0) {
-    ok((f, cut_short)) => { assert_eq(f.content, "hi"); assert_eq(list.len(cut_short), 1) },
-    err(e) => assert_eq(core.error_text(e), ""),
-  }
-  assert(match read_http(p, 200, 0, "data: {\"error\":{\"message\":\"overloaded\"}}\n", "", 0) { err(e) => core.retryable(e), _ => false })
-}
-
-// The stop path is the one that leaks money: a request whose program outlives the shell
-// keeps streaming an answer nobody will read, and keeps being billed for it. What
-// matters is not which pid dies but that the work stops, so the child here keeps
-// writing and the test watches the writing stop. (Kept from golemide, where it was
-// written for its hedge.)
-test "cancel stops the work the request spawned, not only its shell" {
-  let sink = fs.create_temp_file("almai-test-sink")!
-  let pid_file = fs.create_temp_file("almai-test-pid")!
-  let script = "( while true; do echo x >> " + sh_quote(sink) + "; sleep 0.05; done ) & c=$!; echo $c > " + sh_quote(pid_file) + "; wait $c"
-  let shell_pid = process.spawn("sh", ["-c", script])!
-  env.sleep_ms(400)
-  assert(string.len(fs.read_text(sink) ?? "") > 0)
-  // `sink` is not one of the paths cancel removes: the child would recreate it on the
-  // next append, which would hide the very thing measured.
-  let scratch = fs.create_temp_file("almai-test-scratch")!
-  cancel(Pending { sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
-    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: limits(), tools: false, schema_tool: false, warnings: [] })!
-  env.sleep_ms(400)
-  let just_after = string.len(fs.read_text(sink) ?? "")
-  env.sleep_ms(400)
-  assert_eq(string.len(fs.read_text(sink) ?? ""), just_after)
 }

@@ -38,20 +38,8 @@ fn turn_of(m: Value, all: List[Value]) -> (String, List[Value])? = {
   else some(("user", if text == "" then [] else [text_part(text)]))
 }
 
-fn contents_of(messages: List[Value]) -> List[Value] = {
-  var turns: List[(String, List[Value])] = []
-  for m in messages {
-    match turn_of(m, messages) {
-      none => (),
-      some((role, parts)) => if list.is_empty(parts) then ()
-        else match list.last(turns) {
-          some((r, ps)) => if r == role then { turns = list.update(turns, list.len(turns) - 1, (_) => (r, ps + parts)) } else list.push(turns, (role, parts)),
-          none => list.push(turns, (role, parts)),
-        },
-    }
-  }
-  list.map(turns, (t) => value.object([("role", value.str(t.0)), ("parts", value.array(t.1))]))
-}
+fn contents_of(messages: List[Value]) -> List[Value] =
+  list.map(wire.merge_turns(list.filter_map(messages, (m) => turn_of(m, messages))), (t) => value.object([("role", value.str(t.0)), ("parts", value.array(t.1))]))
 
 fn declarations_of(tools: List[Value]) -> List[Value] = list.map(tools, (t) => {
   let f = value.field(t, "function") ?? value.object([])
@@ -70,10 +58,10 @@ fn encode(ask: wire.Ask) -> wire.Encoded = {
     },
     none => (),
   }
-  if budget > 0 then list.push(config, ("thinkingConfig", value.object([("thinkingBudget", value.int(budget)), ("includeThoughts", value.bool(true))]))) else ()
+  if budget > 0 then list.push(config, ("thinkingConfig", value.object([("thinkingBudget", value.int(budget)), ("includeThoughts", value.bool(true))])))
   var fields = [("contents", value.array(contents_of(ask.messages)))]
-  if system != "" then list.push(fields, ("systemInstruction", value.object([("parts", value.array([text_part(system)]))]))) else ()
-  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array([value.object([("functionDeclarations", value.array(declarations_of(ask.tools)))])]))) else ()
+  if system != "" then list.push(fields, ("systemInstruction", value.object([("parts", value.array([text_part(system)]))])))
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array([value.object([("functionDeclarations", value.array(declarations_of(ask.tools)))])])))
   list.push(fields, ("generationConfig", value.object(config)))
   let warnings = if ask.effort != "" and budget == 0 then ["reasoning effort \"" + ask.effort + "\" is not a level or a token budget; no thinking budget was sent"] else []
   wire.Encoded { body: json.stringify(value.object(fields)), warnings: warnings }
@@ -110,7 +98,7 @@ fn fold_event(acc: wire.Folded, ev: Value) -> wire.Folded = {
     some(c) => {
       for p in json.get_array(value.field(c, "content") ?? value.object([]), "parts") ?? [] { f = add_part(f, p) }
       let finish = wire.str_of(c, "finishReason")
-      if finish != "" then { f = wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: finish, usage: f.usage, meter: f.meter } } else ()
+      if finish != "" then { f = wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: finish, usage: f.usage, meter: f.meter } }
     },
     none => (),
   }
@@ -133,7 +121,7 @@ fn fold(text: String) -> Result[wire.Folded, String] = {
           err(_) => { acc = fold_event(acc, ev) },
         },
       }
-    } else ()
+    }
   }
   if failure != "" then err(failure) else ok(acc)
 }

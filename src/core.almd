@@ -124,40 +124,75 @@ fn has_any(body: String, needles: List[String]) -> Bool = {
   list.any(needles, (n) => string.contains(b, n))
 }
 
-// One place that reads a failed HTTP reply. The body is read first, the status second:
-// providers put a context overflow under 400, and a rate limit under 400 or 503.
+// One place that reads a failed HTTP reply, as a table tried in order: a row matches
+// on its status or on words in the body. The body counts first for the causes that
+// come under the wrong status -- a context overflow under 400, a rate limit under 400
+// or 503, an unknown model under Cloudflare's 400 and "No such model". Any other 5xx is
+// the provider overloaded.
+let CAUSES = [
+  ("context", [], ["context_length_exceeded", "context window", "maximum context length", "prompt is too long", "too many tokens", "input is too long", "exceeds the context", "reduce the length"]),
+  ("filtered", [], ["content_filter", "content policy", "content_policy", "safety system", "responsibleaipolicyviolation", "flagged"]),
+  ("rate", [429], ["rate limit", "rate_limit", "too many requests", "quota exceeded", "capacity exceeded"]),
+  ("overloaded", [529], ["overloaded", "server is busy", "service unavailable"]),
+  ("auth", [401, 403], []),
+  ("not_found", [404], ["no such model", "model not found", "model_not_found", "does not exist or you do not have access"]),
+  ("timeout", [408, 504], []),
+  ("bad_request", [400, 422, 413], []),
+]
+
+fn cause_of(status: Int, body: String) -> String =
+  match list.find(CAUSES, (c) => list.contains(c.1, status) or has_any(body, c.2)) {
+    some(c) => c.0,
+    none => if status >= 500 then "overloaded" else "other",
+  }
+
 fn classify(status: Int, body: String, retry_after_ms: Int) -> LlmError = {
   let said = string.take(string.trim(body), 500)
-  if has_any(body, ["context_length_exceeded", "context window", "maximum context length", "prompt is too long", "too many tokens", "input is too long", "exceeds the context", "reduce the length"]) then ErrContextTooLong(said)
-  else if has_any(body, ["content_filter", "content policy", "content_policy", "safety system", "responsibleaipolicyviolation", "flagged"]) then ErrContentFiltered(said)
-  else if status == 429 or has_any(body, ["rate limit", "rate_limit", "too many requests", "quota exceeded", "capacity exceeded"]) then ErrRateLimited(retry_after_ms, said)
-  else if status == 529 or has_any(body, ["overloaded", "server is busy", "service unavailable"]) then ErrOverloaded(status, said)
-  else if status == 401 or status == 403 then ErrAuth(status, said)
-  // Cloudflare answers an unknown model with 400 and "No such model".
-  else if status == 404 or has_any(body, ["no such model", "model not found", "model_not_found", "does not exist or you do not have access"]) then ErrNotFound(status, said)
-  else if status == 408 or status == 504 then ErrTimeout("status " + int.to_string(status) + ": " + said)
-  else if status >= 500 then ErrOverloaded(status, said)
-  else if status == 400 or status == 422 or status == 413 then ErrBadRequest(status, said)
-  else ErrOther(status, said)
+  match cause_of(status, body) {
+    "context" => ErrContextTooLong(said),
+    "filtered" => ErrContentFiltered(said),
+    "rate" => ErrRateLimited(retry_after_ms, said),
+    "overloaded" => ErrOverloaded(status, said),
+    "auth" => ErrAuth(status, said),
+    "not_found" => ErrNotFound(status, said),
+    "timeout" => ErrTimeout("status " + int.to_string(status) + ": " + said),
+    "bad_request" => ErrBadRequest(status, said),
+    _ => ErrOther(status, said),
+  }
 }
 
-// The error as text, in the shapes callers already match on: "status NNN: ...",
-// "transport: ...", "request timeout: ...".
-fn error_text(e: LlmError) -> String = match e {
+// The HTTP status a failure came with, and what the provider said.
+fn status_of(e: LlmError) -> (Int, String)? = match e {
+  ErrRateLimited(_, said) => some((429, said)),
+  ErrOverloaded(status, said) => some((status, said)),
+  ErrAuth(status, said) => some((status, said)),
+  ErrNotFound(status, said) => some((status, said)),
+  ErrBadRequest(status, said) => some((status, said)),
+  ErrOther(status, said) => some((status, said)),
+  _ => none,
+}
+
+// The failures that did not come as an HTTP status.
+fn plain_text(e: LlmError) -> String = match e {
   ErrConfig(m) => m,
-  ErrRateLimited(ms, said) => "status 429: " + said + (if ms > 0 then " (retry after " + int.to_string(ms) + "ms)" else ""),
-  ErrOverloaded(status, said) => "status " + int.to_string(status) + ": " + said,
   ErrTimeout(m) => "request timeout: " + m,
   ErrTransport(m) => "transport: " + m,
   ErrContextTooLong(said) => "context too long: " + said,
   ErrContentFiltered(said) => "content filtered: " + said,
-  ErrAuth(status, said) => "status " + int.to_string(status) + ": " + said,
-  ErrNotFound(status, said) => "status " + int.to_string(status) + ": " + said,
-  ErrBadRequest(status, said) => "status " + int.to_string(status) + ": " + said,
   ErrCancelled => "cancelled",
   ErrTruncated(m) => "truncated: " + m,
   ErrUnreadable(m) => "unreadable answer: " + m,
-  ErrOther(status, said) => "status " + int.to_string(status) + ": " + said,
+  _ => "",
+}
+
+// The error as text, in the shapes callers already match on: "status NNN: ...",
+// "transport: ...", "request timeout: ...".
+fn error_text(e: LlmError) -> String = match status_of(e) {
+  some((status, said)) => "status " + int.to_string(status) + ": " + said + match e {
+    ErrRateLimited(ms, _) => if ms > 0 then " (retry after " + int.to_string(ms) + "ms)" else "",
+    _ => "",
+  },
+  none => plain_text(e),
 }
 
 // Retry-After, as seconds or an HTTP date; the date form is read as "not said".
@@ -175,7 +210,7 @@ fn retry_after_in(headers: String) -> Int = {
       some((k, v)) => {
         let key = string.to_lower(string.trim(k))
         if key == "retry-after-ms" then { ms = int.parse(string.trim(v)) ?? 0 }
-        else if key == "retry-after" then { secs = retry_after_of(v) } else ()
+        else if key == "retry-after" then { secs = retry_after_of(v) }
       },
       none => (),
     }

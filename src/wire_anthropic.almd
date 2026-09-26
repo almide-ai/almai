@@ -40,21 +40,8 @@ fn turn_of(m: Value) -> (String, List[Value])? = {
   else some(("user", if text == "" then [] else [text_block(text)]))
 }
 
-// Turns of the same role run together, so a round of tool results is one user turn.
-fn messages_of(messages: List[Value]) -> List[Value] = {
-  var turns: List[(String, List[Value])] = []
-  for m in messages {
-    match turn_of(m) {
-      none => (),
-      some((role, blocks)) => if list.is_empty(blocks) then ()
-        else match list.last(turns) {
-          some((r, bs)) => if r == role then { turns = list.update(turns, list.len(turns) - 1, (_) => (r, bs + blocks)) } else list.push(turns, (role, blocks)),
-          none => list.push(turns, (role, blocks)),
-        },
-    }
-  }
-  list.map(turns, (t) => value.object([("role", value.str(t.0)), ("content", value.array(t.1))]))
-}
+fn messages_of(messages: List[Value]) -> List[Value] =
+  list.map(wire.merge_turns(list.filter_map(messages, turn_of)), (t) => value.object([("role", value.str(t.0)), ("content", value.array(t.1))]))
 
 fn tools_of(tools: List[Value]) -> List[Value] = list.map(tools, (t) => {
   let f = value.field(t, "function") ?? value.object([])
@@ -89,17 +76,17 @@ fn encode(ask: wire.Ask) -> wire.Encoded = {
     ("messages", value.array(messages_of(ask.messages))),
     ("stream", value.bool(true)),
   ]
-  if system != "" then list.push(fields, ("system", value.str(system))) else ()
-  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(tools_of(ask.tools)))) else ()
+  if system != "" then list.push(fields, ("system", value.str(system)))
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(tools_of(ask.tools))))
   match ask.schema {
     some(s) => if schema_as_tool(ask) then {
       list.push(fields, ("tools", value.array([value.object([("name", value.str(ANSWER_TOOL)),
         ("description", value.str("Give your answer by calling this, with the answer as its input.")), ("input_schema", s)])])))
       list.push(fields, ("tool_choice", value.object([("type", value.str("tool")), ("name", value.str(ANSWER_TOOL))])))
-    } else (),
+    },
     none => (),
   }
-  if budget > 0 then list.push(fields, ("thinking", value.object([("type", value.str("enabled")), ("budget_tokens", value.int(budget))]))) else ()
+  if budget > 0 then list.push(fields, ("thinking", value.object([("type", value.str("enabled")), ("budget_tokens", value.int(budget))])))
   let warnings = (if thinking_warning == "" then [] else [thinking_warning])
     + (if option.is_some(ask.schema) and not list.is_empty(ask.tools) then ["with tools, Anthropic has no way to hold the answer to a schema; the schema was not sent"] else [])
   wire.Encoded { body: json.stringify(value.object(fields)), warnings: warnings }
@@ -188,7 +175,7 @@ fn fold(text: String, schema_tool: Bool) -> Result[wire.Folded, String] = {
         err(e) => { r = Reading { f: r.f, blocks: r.blocks, failure: "unreadable answer: " + e + "; raw: " + string.take(p, 200) } },
         ok(ev) => { r = fold_event(r, ev) },
       }
-    } else ()
+    }
   }
   // A call to a tool that takes nothing streams no arguments at all.
   let whole = with_calls(r.f, list.map(r.f.calls, (c) => wire.ToolCall { id: c.id, name: c.name, arguments: if c.arguments == "" then "{}" else c.arguments }))

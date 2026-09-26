@@ -77,11 +77,19 @@ fn call_name(messages: List[Value], id: String) -> String = {
   var name = "tool"
   for m in messages {
     for c in json.get_array(m, "tool_calls") ?? [] {
-      if str_of(c, "id") == id then { name = str_of(value.field(c, "function") ?? value.object([]), "name") } else ()
+      if str_of(c, "id") == id then { name = str_of(value.field(c, "function") ?? value.object([]), "name") }
     }
   }
   name
 }
+
+// Turns of the same role run together into one, so a round of tool results is one
+// turn, as Anthropic and Gemini both ask; empty turns are dropped.
+fn merge_turns(turns: List[(String, List[Value])]) -> List[(String, List[Value])] =
+  list.fold(list.filter(turns, (t) => not list.is_empty(t.1)), [], (acc, t) => match list.last(acc) {
+    some(last) => if last.0 == t.0 then list.update(acc, list.len(acc) - 1, (_) => (last.0, last.1 + t.1)) else acc + [t],
+    none => [t],
+  })
 
 // A tool call's arguments as the object they encode; {} when they are not one.
 fn arguments_object(args: String) -> Value = match json.parse(if string.trim(args) == "" then "{}" else args) {

@@ -49,23 +49,25 @@ fn system(messages: List[Value], tools: List[Value]) -> String = {
 fn prompt(messages: List[Value], from: Int, fresh: Bool) -> String = {
   let rest = list.drop(messages, from)
   let users = list.filter(rest, (m) => str_of(m, "role") != "system")
-  if fresh and list.len(users) == 1 and str_of(list.first(users) ?? value.object([]), "role") == "user" then str_of(list.first(users) ?? value.object([]), "content")
-  else {
-    var parts: List[String] = []
-    for m in rest {
-      let role = str_of(m, "role")
-      if role == "user" then list.push(parts, (if fresh then "User: " else "") + str_of(m, "content"))
-      else if role == "tool" then list.push(parts, "Result of " + wire.call_name(messages, str_of(m, "tool_call_id")) + ":\n" + str_of(m, "content"))
-      else if role == "assistant" and fresh then {
-        let calls = list.map(json.get_array(m, "tool_calls") ?? [], (c) => {
-          let f = value.field(c, "function") ?? value.object([])
-          str_of(f, "name") + " " + str_of(f, "arguments")
-        })
-        list.push(parts, "You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + string.join(calls, "; ")))
-      } else ()
-    }
-    string.join(parts, "\n\n")
+  let only = list.first(users) ?? value.object([])
+  if fresh and list.len(users) == 1 and str_of(only, "role") == "user" then str_of(only, "content")
+  else string.join(list.filter_map(rest, (m) => line_of(m, messages, fresh)), "\n\n")
+}
+
+// One message as a paragraph of the prompt, or none for what claude need not see again:
+// the system prompt, and, in a continued session, its own answers.
+fn line_of(m: Value, messages: List[Value], fresh: Bool) -> String? = {
+  let role = str_of(m, "role")
+  if role == "user" then some((if fresh then "User: " else "") + str_of(m, "content"))
+  else if role == "tool" then some("Result of " + wire.call_name(messages, str_of(m, "tool_call_id")) + ":\n" + str_of(m, "content"))
+  else if role == "assistant" and fresh then {
+    let calls = list.map(json.get_array(m, "tool_calls") ?? [], (c) => {
+      let f = value.field(c, "function") ?? value.object([])
+      str_of(f, "name") + " " + str_of(f, "arguments")
+    })
+    some("You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + string.join(calls, "; ")))
   }
+  else none
 }
 
 fn session_of(text: String) -> Session? = match json.parse(text) {
@@ -85,9 +87,9 @@ fn continuing(s: Session?, message_count: Int, model: String) -> Session? = matc
 // continued; `resume` continues one, which already has its system prompt.
 fn args(model_id: String, resume: String, system_path: String, schema: Value?, keep: Bool) -> List[String] = {
   var args = ["claude", "-p", "--output-format", "json", "--tools", "", "--setting-sources", "", "--strict-mcp-config"]
-  if not keep then { args = args + ["--no-session-persistence"] } else ()
+  if not keep then { args = args + ["--no-session-persistence"] }
   match schema { some(sc) => { args = args + ["--json-schema", json.stringify(sc)] }, none => () }
-  if model_id != "" then { args = args + ["--model", model_id] } else ()
+  if model_id != "" then { args = args + ["--model", model_id] }
   if resume != "" then { args = args + ["--resume", resume] } else { args = args + ["--system-prompt-file", system_path] }
   args
 }

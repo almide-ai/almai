@@ -39,63 +39,51 @@ fn sampling_of(opts: CallOptions) -> Sampling =
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
 
-effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] =
-  match require_env("AWS_ACCESS_KEY_ID") {
-    err(e) => err("bedrock: " + e)
-    ok(access_key) => match require_env("AWS_SECRET_ACCESS_KEY") {
-      err(e) => err("bedrock: " + e)
-      ok(secret_key) => {
-        let region = env.get("AWS_REGION") |> option.unwrap_or("us-east-1")
-        let url = "https://bedrock-runtime." + region + ".amazonaws.com/model/" + model + "/converse"
-        let messages = value.array(list.map(
-          list.filter(msgs, (m) => m.role != "system"),
-          (m) => value.object([
-            ("role", value.str(m.role)),
-            ("content", value.array([value.object([("text", value.str(m.content))])])),
-          ])
-        ))
-        let sys = if opts.system != "" then opts.system
-          else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
-        let fields = [("messages", messages), ("inferenceConfig", value.object([("maxTokens", value.int(opts.max_tokens))]))]
-        let fields = if sys != "" then
-          fields + [("system", value.array([value.object([("text", value.str(sys))])]))]
-        else fields
-        let body = json.stringify(value.object(fields))
+effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let _ = require_env("AWS_ACCESS_KEY_ID") |> result.map_err((e) => "bedrock: " + e)!
+  let _ = require_env("AWS_SECRET_ACCESS_KEY") |> result.map_err((e) => "bedrock: " + e)!
+  let region = env.get("AWS_REGION") |> option.unwrap_or("us-east-1")
+  let url = "https://bedrock-runtime." + region + ".amazonaws.com/model/" + model + "/converse"
+  // Note: Full SigV4 signing requires HMAC-SHA256 which Almide stdlib doesn't yet support.
+  // For now, this provider works when called through an AWS SDK proxy or when
+  // AWS_SESSION_TOKEN is available (e.g., IAM role with temporary credentials via aws-vault).
+  // TODO: Implement SigV4 signing when bytes.hmac_sha256 is available.
+  let headers: Map[String, String] = [
+    "Content-Type": "application/json",
+    "X-Amz-Security-Token": env.get("AWS_SESSION_TOKEN") |> option.unwrap_or(""),
+  ]
+  let raw = http.request("POST", url, json.stringify(body_of(msgs, opts)), headers) |> result.map_err((e) => "bedrock: http: " + e)!
+  let parsed = json.parse(raw) |> result.map_err((e) => "bedrock: json: " + e)!
+  ok(response_of(parsed, model, opts))
+}
 
-        // Note: Full SigV4 signing requires HMAC-SHA256 which Almide stdlib doesn't yet support.
-        // For now, this provider works when called through an AWS SDK proxy or when
-        // AWS_SESSION_TOKEN is available (e.g., IAM role with temporary credentials via aws-vault).
-        // TODO: Implement SigV4 signing when bytes.hmac_sha256 is available.
-        let headers: Map[String, String] = [
-          "Content-Type": "application/json",
-          "X-Amz-Security-Token": env.get("AWS_SESSION_TOKEN") |> option.unwrap_or(""),
-        ]
-        match http.request("POST", url, body, headers) {
-          err(e) => err("bedrock: http: " + e)
-          ok(raw) => match json.parse(raw) {
-            err(e) => err("bedrock: json: " + e)
-            ok(parsed) => {
-              let content = value.field(parsed, "output")?
-                |> option.flat_map((o) => value.field(o, "message")?)
-                |> option.flat_map((m) => json.get_array(m, "content"))
-                |> option.flat_map((cs) => list.first(cs))
-                |> option.flat_map((c) => json.get_string(c, "text"))
-                |> option.unwrap_or("")
-              let u = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
-              ok(LLMResponse {
-                content: string.trim(content), model: model,
-                usage: Usage {
-                  prompt_tokens: json.get_int(u, "inputTokens") |> option.unwrap_or(0),
-                  completion_tokens: json.get_int(u, "outputTokens") |> option.unwrap_or(0),
-                  total_tokens: json.get_int(u, "totalTokens") |> option.unwrap_or(0),
-                },
-                finish_reason: json.get_string(parsed, "stopReason") |> option.unwrap_or("end_turn"),
-                tool_calls: [],
-                sampling: sampling_of(opts),
-              })
-            }
-          }
-        }
-      }
-    }
+// The Converse API's request: messages as text blocks, the system prompt apart.
+fn body_of(msgs: List[Message], opts: CallOptions) -> Value = {
+  let messages = value.array(list.map(list.filter(msgs, (m) => m.role != "system"),
+    (m) => value.object([("role", value.str(m.role)), ("content", value.array([value.object([("text", value.str(m.content))])]))])))
+  let sys = if opts.system != "" then opts.system
+    else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+  let fields = [("messages", messages), ("inferenceConfig", value.object([("maxTokens", value.int(opts.max_tokens))]))]
+  value.object(if sys != "" then fields + [("system", value.array([value.object([("text", value.str(sys))])]))] else fields)
+}
+
+fn response_of(parsed: Value, model: String, opts: CallOptions) -> LLMResponse = {
+  let content = value.field(parsed, "output")?
+    |> option.flat_map((o) => value.field(o, "message")?)
+    |> option.flat_map((m) => json.get_array(m, "content"))
+    |> option.flat_map((cs) => list.first(cs))
+    |> option.flat_map((c) => json.get_string(c, "text"))
+    |> option.unwrap_or("")
+  let u = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
+  LLMResponse {
+    content: string.trim(content), model: model,
+    usage: Usage {
+      prompt_tokens: json.get_int(u, "inputTokens") |> option.unwrap_or(0),
+      completion_tokens: json.get_int(u, "outputTokens") |> option.unwrap_or(0),
+      total_tokens: json.get_int(u, "totalTokens") |> option.unwrap_or(0),
+    },
+    finish_reason: json.get_string(parsed, "stopReason") |> option.unwrap_or("end_turn"),
+    tool_calls: [],
+    sampling: sampling_of(opts),
   }
+}

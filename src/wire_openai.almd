@@ -22,12 +22,12 @@ fn encode(ask: wire.Ask) -> wire.Encoded = {
     ("messages", value.array(ask.messages)),
     ("stream", value.bool(true)),
   ]
-  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(ask.tools))) else ()
+  if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(ask.tools)))
   if ask.provider == "cf" or ask.provider == "openai" then list.push(fields, ("max_completion_tokens", value.int(ask.max_tokens)))
   else list.push(fields, ("max_tokens", value.int(ask.max_tokens)))
-  if ask.effort != "" then list.push(fields, ("reasoning_effort", value.str(ask.effort))) else ()
-  if ask.provider != "cf" then list.push(fields, ("stream_options", value.object([("include_usage", value.bool(true))]))) else ()
-  if ask.provider == "openrouter" then list.push(fields, ("usage", value.object([("include", value.bool(true))]))) else ()
+  if ask.effort != "" then list.push(fields, ("reasoning_effort", value.str(ask.effort)))
+  if ask.provider != "cf" then list.push(fields, ("stream_options", value.object([("include_usage", value.bool(true))])))
+  if ask.provider == "openrouter" then list.push(fields, ("usage", value.object([("include", value.bool(true))])))
   match ask.schema {
     some(s) => list.push(fields, ("response_format", value.object([
       ("type", value.str("json_schema")),
@@ -116,7 +116,7 @@ fn fold(text: String) -> Result[wire.Folded, String] = {
           err(_) => { acc = fold_chunk(acc, chunk) },
         },
       }
-    } else ()
+    }
   }
   if failure != "" then err(failure) else ok(acc)
 }
