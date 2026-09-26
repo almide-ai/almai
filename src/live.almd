@@ -5,11 +5,13 @@
 // request that is not arriving. `start` / `is_done` / `text_so_far` / `cancel` /
 // `finish` do that step by step; `run(req, limits, hedge_ms, cap_ms)` all at once.
 //
-// The request runs in the background (curl, or claude -p), writing to files, so it can
-// be read while it arrives and killed at any point, and curl bounds it: `max-time` for
-// the whole request, `speed-limit`/`speed-time` for a stream that stops talking. Every
-// chat request is streamed: a non-streamed Cloudflare request past about four minutes
-// is ended with `408`. Credentials go in curl's config file, never on a command line.
+// An HTTP request is a call handle of the runtime's (`http.start`): it is bounded by
+// `total` for the whole request and `idle` for a stream that stops talking, it can be
+// looked at without waiting, and it is closed on cancel. What arrives is kept in a file
+// as it comes, so the answer so far can be read at any point. claude -p runs as a program
+// in the background, writing to files. Every chat request is streamed: a non-streamed
+// Cloudflare request past about four minutes is ended with `408`. Credentials go in the
+// request's headers, never on a command line or in a file.
 //
 // Where a model id goes is almai.route; the formats themselves are the pure wire_*
 // modules. Messages and tools are in the OpenAI chat shape, whatever the model.
@@ -17,6 +19,7 @@
 import env
 import fs
 import process
+import http
 import self.core as core
 import self.route as route
 import self.wire as wire
@@ -24,6 +27,7 @@ import self.wire_openai as wire_openai
 import self.wire_anthropic as wire_anthropic
 import self.wire_gemini as wire_gemini
 import self.wire_claude as wire_claude
+import self.answer as answer
 
 // ── Types ──
 
@@ -54,9 +58,11 @@ type Limits = { total_s: Int, idle_s: Int }
 
 fn limits() -> Limits = Limits { total_s: 900, idle_s: 120 }
 
-// A request in flight. The shell appends the program's exit status to `out` when it is
-// really finished, which is what "done" means -- the stream having stopped growing does not.
-type Pending = { sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String, headers: String,
+// A request in flight. An HTTP one holds its `call`, and `stream` is what has arrived of
+// it so far. A claude -p one is a program in the background, and its shell appends the
+// exit status to `out` when it is really finished, which is what "done" means -- the
+// stream having stopped growing does not. `id` tells a hedge from the request it copies.
+type Pending = { id: Int, call: http.HttpCall?, sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String,
   t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, schema_tool: Bool, warnings: List[String] }
 
 // Where a model id goes lives in almai.route; these keep the names callers use.
@@ -74,22 +80,6 @@ fn encode(ep: route.Endpoint, req: Request) -> wire.Encoded =
   else if ep.kind == "gemini" then wire_gemini.encode(ask_of(ep, req))
   else wire_openai.encode(ask_of(ep, req))
 
-// `schema_tool`: an Anthropic request that sent its schema as the "answer" tool.
-fn fold_as(kind: String, schema_tool: Bool, text: String) -> Result[wire.Folded, String] =
-  if kind == "anthropic" then wire_anthropic.fold(text, schema_tool)
-  else if kind == "gemini" then wire_gemini.fold(text)
-  else wire_openai.fold(text)
-
-fn quoted(s: String) -> String = "\"" + string.replace(string.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
-
-// The response headers go to `headers_path`: Retry-After lives there.
-fn curl_config(ep: route.Endpoint, body_path: String, stream_path: String, headers_path: String, l: Limits) -> String =
-  string.join(["url = " + quoted(ep.url), "request = \"POST\"", "header = \"Content-Type: application/json\""]
-    + list.map(ep.headers, (h) => "header = " + quoted(h))
-    + ["data = " + quoted("@" + body_path), "output = " + quoted(stream_path), "dump-header = " + quoted(headers_path),
-      "max-time = " + int.to_string(l.total_s), "speed-limit = 1", "speed-time = " + int.to_string(l.idle_s),
-      "silent", "show-error", "no-buffer", "write-out = \"%{http_code}\""], "\n") + "\n"
-
 // ── The answer ──
 
 fn reply_of(f: wire.Folded, ep: route.Endpoint, ms: Int, warnings: List[String]) -> Reply = {
@@ -106,37 +96,45 @@ fn sh_quote(s: String) -> String = "'" + string.replace(s, "'", "'\\''") + "'"
 
 effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   let ep = endpoint(req.model) |> result.map_err((e) => core.ErrConfig(e))!
-  let stream_path = temp("almai-stream")!
+  let fresh = Pending { id: 1, call: none, sh_pid: 0, pid_file: "", stream: temp("almai-stream")!, cfg: "", body: "", out: "", err: "",
+    t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
+    tools: not list.is_empty(req.tools), schema_tool: ep.kind == "anthropic" and wire_anthropic.schema_as_tool(ask_of(ep, req)), warnings: [] }
+  if ep.kind == "claude" then start_claude(req, ep, fresh) else start_http(req, ep, fresh)
+}
+
+effect fn start_http(req: Request, ep: route.Endpoint, p: Pending) -> Result[Pending, core.LlmError] = {
+  let encoded = encode(ep, req)
+  let limits = http.HttpLimits { total_ms: p.limits.total_s * 1000, idle_ms: p.limits.idle_s * 1000 }
+  let call = http.start("POST", ep.url, encoded.body, headers_of(ep), limits) |> result.map_err((e) => core.ErrTransport(e))!
+  ok({ ...p, call: some(call), warnings: encoded.warnings })
+}
+
+// The endpoint's `Name: value` headers, and the body's type.
+fn headers_of(ep: route.Endpoint) -> Map[String, String] = {
+  var m: Map[String, String] = ["Content-Type": "application/json"]
+  for h in ep.headers {
+    match string.split_once(h, ":") { some((k, v)) => map.insert(m, string.trim(k), string.trim(v)), none => () }
+  }
+  m
+}
+
+effect fn start_claude(req: Request, ep: route.Endpoint, p: Pending) -> Result[Pending, core.LlmError] = {
   let cfg_path = temp("almai-cfg")!
   let body_path = temp("almai-body")!
   let out_path = temp("almai-out")!
   let err_path = temp("almai-err")!
   let pid_path = temp("almai-pid")!
-  let headers_path = temp("almai-headers")!
-  // The program runs in the background so its own pid is known: killing the shell alone
-  // would leave the request running, still streaming and still billed.
-  let tail = " & p=$!; echo $p > " + sh_quote(pid_path) + "; wait $p; "
-  let encoded = if ep.kind == "claude" then wire.Encoded { body: "", warnings: wire_claude.warnings(ask_of(ep, req)) } else encode(ep, req)
-  let script = if ep.kind == "claude" then {
-    let session = if req.session == "" then none else wire_claude.continuing(wire_claude.session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
-    let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
-    fs.write(body_path, wire_claude.prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-    fs.write(cfg_path, wire_claude.system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-    // From the temp directory, so no project file of the person's is read as memory and
-    // the sessions are filed apart from theirs.
-    "cd \"$" + "{TMPDIR:-/tmp}\" && (" + string.join(list.map(wire_claude.args(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != ""), sh_quote), " ") + ") < " + sh_quote(body_path)
-      + " > " + sh_quote(stream_path) + " 2> " + sh_quote(err_path) + tail + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
-  } else {
-    fs.write(body_path, encoded.body) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-    fs.write(cfg_path, curl_config(ep, body_path, stream_path, headers_path, l)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-    "curl --config " + sh_quote(cfg_path) + " > " + sh_quote(out_path) + " 2> " + sh_quote(err_path)
-      + tail + "printf '\\n%s\\n' \"$?\" >> " + sh_quote(out_path)
-  }
+  let session = if req.session == "" then none else wire_claude.continuing(wire_claude.session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
+  let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
+  fs.write(body_path, wire_claude.prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+  fs.write(cfg_path, wire_claude.system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+  // From the temp directory, so no project file of the person's is read as memory and
+  // the sessions are filed apart from theirs. The program runs in the background so its
+  // own pid is known: killing the shell alone would leave it running.
+  let script = "cd \"$" + "{TMPDIR:-/tmp}\" && (" + string.join(list.map(wire_claude.args(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != ""), sh_quote), " ") + ") < " + sh_quote(body_path)
+    + " > " + sh_quote(p.stream) + " 2> " + sh_quote(err_path) + " & p=$!; echo $p > " + sh_quote(pid_path) + "; wait $p; " + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
   let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.ErrTransport("spawn: " + e))!
-  ok(Pending { sh_pid: pid, pid_file: pid_path, stream: stream_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, headers: headers_path,
-    t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
-    tools: not list.is_empty(req.tools), schema_tool: ep.kind == "anthropic" and wire_anthropic.schema_as_tool(ask_of(ep, req)),
-    warnings: encoded.warnings })
+  ok({ ...p, sh_pid: pid, pid_file: pid_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, warnings: wire_claude.warnings(ask_of(ep, req)) })
 }
 
 // `out` is the HTTP status with no newline, then the exit status on its own line.
@@ -149,36 +147,41 @@ fn exit_of(out: String) -> (Int, Int)? = {
   }
 }
 
-effect fn is_done(p: Pending) -> Bool = option.is_some(exit_of(fs.read_text(p.out) ?? ""))
+effect fn is_done(p: Pending) -> Bool = match p.call {
+  some(c) => option.is_some(http.poll(c)),
+  none => option.is_some(exit_of(fs.read_text(p.out) ?? "")),
+}
 
 // What the model has written so far, from the chunks that arrived whole. claude -p
 // answers all at once, so "" until then.
-effect fn text_so_far(p: Pending) -> String =
-  if p.kind == "claude" then ""
-  else match fold_as(p.kind, p.schema_tool, wire.whole_lines(fs.read_text(p.stream) ?? "")) {
-    ok(f) => f.content,
-    err(_) => "",
-  }
+effect fn text_so_far(p: Pending) -> String = match p.call {
+  none => "",
+  some(c) => {
+    let _ = fs.append(p.stream, http.read_new(c))
+    match answer.fold_as(p.kind, p.schema_tool, wire.whole_lines(fs.read_text(p.stream) ?? "")) {
+      ok(f) => f.content,
+      err(_) => "",
+    }
+  },
+}
 
 effect fn clean_up(p: Pending) -> Unit = {
-  // The config holds the credentials, so it goes whatever else happens.
-  let _ = fs.remove(p.cfg)
-  let _ = fs.remove(p.body)
-  let _ = fs.remove(p.stream)
-  let _ = fs.remove(p.out)
-  let _ = fs.remove(p.err)
-  let _ = fs.remove(p.pid_file)
-  let _ = fs.remove(p.headers)
+  for f in list.filter([p.stream, p.cfg, p.body, p.out, p.err, p.pid_file], (f) => f != "") { let _ = fs.remove(f) }
   ()
 }
 
-// Stop it: the program first, then the shell waiting on it.
+// Stop it: the connection closed, or the program and then the shell waiting on it.
 effect fn cancel(p: Pending) -> Unit = {
-  match int.parse(string.trim(fs.read_text(p.pid_file) ?? "")) {
-    ok(pid) => if process.is_alive(pid) then { let _ = process.kill(pid, 15); () },
-    err(_) => (),
+  match p.call {
+    some(c) => http.cancel(c),
+    none => {
+      match int.parse(string.trim(fs.read_text(p.pid_file) ?? "")) {
+        ok(pid) => if process.is_alive(pid) then { let _ = process.kill(pid, 15); () },
+        err(_) => (),
+      }
+      if process.is_alive(p.sh_pid) then { let _ = process.kill(p.sh_pid, 15); () }
+    },
   }
-  if process.is_alive(p.sh_pid) then { let _ = process.kill(p.sh_pid, 15); () }
   clean_up(p)!
 }
 
@@ -187,23 +190,34 @@ effect fn cancel(p: Pending) -> Unit = {
 // `status NNN: ...`, `transport: ...`, `request timeout: ...`.
 // (No `!` on the Unit and Bool effect calls in the functions that fail with a
 // core.LlmError: almide#2635, `!` there passes check and fails in rustc.)
-effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = {
-  let (status, code) = exit_of(fs.read_text(p.out) ?? "") ?? (0, 0)
-  let text = fs.read_text(p.stream) ?? ""
-  let said = string.trim(fs.read_text(p.err) ?? "")
-  let headers = fs.read_text(p.headers) ?? ""
-  let ms = env.millis() - p.t0
-  let _ = clean_up(p)
-  if p.kind == "claude" then finish_claude(p, text, code, said, ms)
-  else match read_http(p, status, code, text, said, core.retry_after_in(headers)) {
-    ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? route.Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
-      p.warnings + cut_short)),
-    err(e) => err(e),
-  }
+effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = match p.call {
+  none => finish_claude(p),
+  some(c) => {
+    let answered = http.wait(c)
+    let ms = env.millis() - p.t0
+    let _ = clean_up(p)
+    match answered {
+      err(e) => err(answer.call_failure(e)),
+      ok(r) => match answer.read_http(answer.Shape { kind: p.kind, schema_tool: p.schema_tool }, http.status_code(r), http.body(r), core.retry_after_in(retry_headers(r))) {
+        ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? route.Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
+          p.warnings + cut_short)),
+        err(e) => err(e),
+      },
+    }
+  },
 }
 
+// The two headers a rate limit's wait is read from, in core.retry_after_in's shape.
+fn retry_headers(r: HttpResponse) -> String =
+  string.join(list.filter_map(["retry-after-ms", "retry-after"], (k) => option.map(http.get_header(r, k), (v) => k + ": " + v)), "\n")
+
 // claude -p's answer, and its session kept for the next call.
-effect fn finish_claude(p: Pending, text: String, code: Int, said: String, ms: Int) -> Result[Reply, core.LlmError] =
+effect fn finish_claude(p: Pending) -> Result[Reply, core.LlmError] = {
+  let (_, code) = exit_of(fs.read_text(p.out) ?? "") ?? (0, 0)
+  let text = fs.read_text(p.stream) ?? ""
+  let said = string.trim(fs.read_text(p.err) ?? "")
+  let ms = env.millis() - p.t0
+  let _ = clean_up(p)
   match wire_claude.read(text, code, said, p.tools) {
     ok((f, sid)) => {
       if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () }
@@ -211,30 +225,7 @@ effect fn finish_claude(p: Pending, text: String, code: Int, said: String, ms: I
     },
     err(e) => err(e),
   }
-
-// What a finished curl request amounts to: curl's exit first, then the HTTP status,
-// then the stream. The answer comes with a warning when the stream ended without
-// saying why.
-fn read_http(p: Pending, status: Int, code: Int, text: String, said: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
-  match curl_failure(code, said, p.limits) {
-    some(e) => err(e),
-    none => if status < 200 or status >= 300 then err(core.classify(status, text, retry_after_ms)) else read_stream(p, text, retry_after_ms),
-  }
-
-// curl's own exit codes: 28 is a deadline, 143 and 137 a kill.
-fn curl_failure(code: Int, said: String, l: Limits) -> core.LlmError? =
-  if code == 0 then none
-  else if code == 28 then some(core.ErrTimeout("no answer within " + int.to_string(l.total_s) + "s, or nothing for " + int.to_string(l.idle_s) + "s"))
-  else if code == 143 or code == 137 then some(core.ErrCancelled)
-  else some(core.ErrTransport("curl exit " + int.to_string(code) + (if said == "" then "" else ": " + string.take(said, 300))))
-
-fn read_stream(p: Pending, text: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
-  match fold_as(p.kind, p.schema_tool, text) {
-    // An error sent inside the stream, after a 200: read like a failed reply's body.
-    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, retry_after_ms) else core.ErrUnreadable(e)),
-    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
-      else ok((f, if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else [])),
-  }
+}
 
 // ── All at once ──
 
@@ -262,9 +253,9 @@ effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran
       err(core.ErrTimeout("no complete answer within " + int.to_string(deadline / 1000) + "s"))
     },
     some(w) => {
-      let _ = cancel_all(list.filter(started, (p) => p.sh_pid != w.sh_pid))
+      let _ = cancel_all(list.filter(started, (p) => p.id != w.id))
       let r = finish(w)!
-      ok(Ran { reply: r, hedged: option.is_some(second), won_by_hedge: w.sh_pid != first.sh_pid })
+      ok(Ran { reply: r, hedged: option.is_some(second), won_by_hedge: w.id != first.id })
     },
   }
 }
@@ -278,7 +269,7 @@ effect fn race(req: Request, l: Limits, first: Pending, hedge_at: Int, t0: Int, 
   while option.is_none(winner) and not timed_out {
     let waited = env.millis() - t0
     winner = done_of(first, second) ?? none
-    if option.is_none(winner) and option.is_none(second) and hedge_at > 0 and waited > hedge_at then { second = some(start(req, l)!) }
+    if option.is_none(winner) and option.is_none(second) and hedge_at > 0 and waited > hedge_at then { second = some({ ...start(req, l)!, id: 2 }) }
     if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) }
   }
   ok((winner, second))

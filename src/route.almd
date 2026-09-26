@@ -23,8 +23,8 @@ import env
 import self.core as core
 
 // `kind` is the format spoken: "chat" (OpenAI-compatible), "anthropic", "gemini", or
-// "claude" (claude -p). `headers` carry the
-// credentials, and so are only ever written to curl's config file.
+// "claude" (claude -p). `headers` carry the credentials, and so only ever go on the
+// request itself.
 type Endpoint = { kind: String, provider: String, url: String, headers: List[String], model_id: String }
 
 

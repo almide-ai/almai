@@ -7,6 +7,7 @@ import self.core as core
 import self.route as route
 import self.wire as wire
 import self.live as live
+import self.answer as answer
 
 
 test "each endpoint's format gets the request, and its answer is read back the same way" {
@@ -17,13 +18,13 @@ test "each endpoint's format gets the request, and its answer is read back the s
   assert(string.contains(live.encode(ep("gemini", "gemini"), req).body, "\"systemInstruction\""))
   let anthropic = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n"
     + "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n"
-  assert_eq(option.map(result.to_option(live.fold_as("anthropic", false, anthropic)), (f) => f.content), some("hi"))
-  assert_eq(option.map(result.to_option(live.fold_as("gemini", false, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n")), (f) => f.content), some("hi"))
+  assert_eq(option.map(result.to_option(answer.fold_as("anthropic", false, anthropic)), (f) => f.content), some("hi"))
+  assert_eq(option.map(result.to_option(answer.fold_as("gemini", false, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n")), (f) => f.content), some("hi"))
 }
 
 test "the cost is the provider's meter, else the price table, else not known" {
   let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n"
-  let f = live.fold_as("chat", false, sse) ?? wire.empty()
+  let f = answer.fold_as("chat", false, sse) ?? wire.empty()
   let r = live.reply_of(f, route.Endpoint { kind: "chat", provider: "cf", url: "", headers: [], model_id: "@cf/zai-org/glm-5.3-flash" }, 10, [])
   assert_eq((r.usage.input, r.usage.cache_read, r.usage.output), (some(60), some(40), some(20)))
   assert_eq((r.finish, r.raw_finish), (core.FinishToolCalls, "tool_calls"))
@@ -33,24 +34,31 @@ test "the cost is the provider's meter, else the price table, else not known" {
   assert_eq(live.reply_of(wire.empty(), route.Endpoint { kind: "anthropic", provider: "anthropic", url: "", headers: [], model_id: "x" }, 1, []).cost.source, "none")
 }
 
-test "a request is done only once the shell has written the exit status" {
+test "a claude -p request is done only once the shell has written the exit status" {
   assert_eq(live.exit_of("200"), none)
   assert_eq(live.exit_of("200\n0\n"), some((200, 0)))
   assert_eq(live.exit_of("000\n28\n"), some((0, 28)))
 }
 
-test "a finished request is read: curl's exit, then the status, then the stream" {
-  let p = live.Pending { sh_pid: 0, pid_file: "", stream: "", cfg: "", body: "", out: "", err: "", headers: "", t0: 0, model: "", kind: "chat",
-    session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] }
-  assert(match live.read_http(p, 0, 28, "", "", 0) { err(core.ErrTimeout(_)) => true, _ => false })
-  assert(match live.read_http(p, 0, 6, "", "Could not resolve host", 0) { err(core.ErrTransport(m)) => string.contains(m, "curl exit 6"), _ => false })
-  assert_eq(live.read_http(p, 429, 0, "slow down", "", 3000), err(core.ErrRateLimited(3000, "slow down")))
-  assert(match live.read_http(p, 200, 0, "", "", 0) { err(core.ErrTruncated(_)) => true, _ => false })
-  match live.read_http(p, 200, 0, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", "", 0) {
+test "a finished request is read: the call's end, then the status, then the stream" {
+  let sh = answer.Shape { kind: "chat", schema_tool: false }
+  assert_eq(answer.call_failure("request timeout: idle_ms 120000 exceeded"), core.ErrTimeout("idle_ms 120000 exceeded"))
+  assert_eq(answer.call_failure("request cancelled"), core.ErrCancelled)
+  assert(match answer.call_failure("connection refused") { core.ErrTransport(m) => string.contains(m, "refused"), _ => false })
+  assert_eq(answer.read_http(sh, 429, "slow down", 3000), err(core.ErrRateLimited(3000, "slow down")))
+  assert(match answer.read_http(sh, 200, "", 0) { err(core.ErrTruncated(_)) => true, _ => false })
+  match answer.read_http(sh, 200, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", 0) {
     ok((f, cut_short)) => { assert_eq(f.content, "hi"); assert_eq(list.len(cut_short), 1) },
     err(e) => assert_eq(core.error_text(e), ""),
   }
-  assert(match live.read_http(p, 200, 0, "data: {\"error\":{\"message\":\"overloaded\"}}\n", "", 0) { err(e) => core.retryable(e), _ => false })
+  assert(match answer.read_http(sh, 200, "data: {\"error\":{\"message\":\"overloaded\"}}\n", 0) { err(e) => core.retryable(e), _ => false })
+}
+
+test "an endpoint's headers go on the request, with the body's type" {
+  let h = live.headers_of(route.Endpoint { kind: "anthropic", provider: "anthropic", url: "", headers: ["x-api-key: k:1", "anthropic-version: 2023-06-01"], model_id: "m" })
+  assert_eq(map.get(h, "x-api-key"), some("k:1"))
+  assert_eq(map.get(h, "anthropic-version"), some("2023-06-01"))
+  assert_eq(map.get(h, "Content-Type"), some("application/json"))
 }
 
 // The stop path is the one that leaks money: a request whose program outlives the shell
@@ -68,8 +76,8 @@ test "cancel stops the work the request spawned, not only its shell" {
   // `sink` is not one of the paths live.cancel removes: the child would recreate it on the
   // next append, which would hide the very thing measured.
   let scratch = fs.create_temp_file("almai-test-scratch")!
-  live.cancel(live.Pending { sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
-    headers: scratch, t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] })!
+  live.cancel(live.Pending { id: 1, call: none, sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
+    t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] })!
   env.sleep_ms(400)
   let just_after = string.len(fs.read_text(sink) ?? "")
   env.sleep_ms(400)

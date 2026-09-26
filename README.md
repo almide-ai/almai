@@ -189,11 +189,12 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
 | `NAME:MODEL` | any other OpenAI-compatible service | `NAME_BASE_URL`, `NAME_API_KEY` |
 | `claude`, `claude:opus`, `cli/claude` | Claude Code's `claude -p`, on its own login | `claude` on `PATH` |
 
-- The request runs in the background (curl, or claude) and writes to files, so it can be
-  read while it arrives and stopped at any point, and curl bounds it in time. Chat
-  requests are always streamed: a non-streamed Cloudflare request past about four
-  minutes is ended with `408`. Credentials go in curl's config file, never on a
-  command line.
+- An HTTP request is a call handle of the runtime's (`http.start`, in the Almide
+  release after 0.63.1), so it can be read while it arrives, stopped at any point, and bounded in time
+  as a whole and between bytes. `claude` runs in the background and writes to files.
+  Chat requests are always streamed: a non-streamed Cloudflare request past about four
+  minutes is ended with `408`. Credentials go in the request's headers, never on a
+  command line or in a file.
 - `messages` and `tools` are in the OpenAI chat shape whatever the model; each format
   translates them. For Anthropic: the system on top, calls as `tool_use`, a round of
   results in one user turn. For Gemini: `systemInstruction`, `functionCall` /
@@ -274,7 +275,8 @@ For custom initial delay, use `call_retry_with_delay(..., max_attempts, base_del
 ```
 src/
   mod.almd              Public API, types, dispatch
-  live.almd             Calls you can watch, stop and bound in time (curl / claude -p)
+  live.almd             Calls you can watch, stop and bound in time (HTTP handle / claude -p)
+  answer.almd           What a finished HTTP request amounts to: the status, then the stream
   core.almd             Finish, usage, cost and errors, shared by every provider
   wire.almd             What the wire formats share: the request asked, the answer read
   wire_openai.almd      Chat completions: body and stream, pure (OpenAI, Cloudflare, …)
@@ -293,8 +295,8 @@ src/
 ```
 
 All providers are pure Almide — no external SDK dependencies. The providers under
-`providers/` call the REST API via `http.request`; `almai.live` runs `curl` or `claude`
-in the background, and reads what comes back with the `wire_*` modules. Those hold no
+`providers/` call the REST API via `http.request`; `almai.live` holds an HTTP call handle or runs
+`claude` in the background, and reads what comes back with the `wire_*` modules. Those hold no
 transport at all: `encode` makes the body, `fold` reads a stream or the part of one
 that has arrived, and a test gives them a recorded stream.
 

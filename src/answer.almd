@@ -1,0 +1,39 @@
+// almai.answer — what a finished HTTP request amounts to, whatever the provider: the
+// call's end, the status, then the stream read in the endpoint's format.
+
+import self.core as core
+import self.wire as wire
+import self.wire_openai as wire_openai
+import self.wire_anthropic as wire_anthropic
+import self.wire_gemini as wire_gemini
+
+// Which format the stream is in. `schema_tool`: an Anthropic request that sent its
+// schema as the "answer" tool.
+type Shape = { kind: String, schema_tool: Bool }
+
+fn fold_as(kind: String, schema_tool: Bool, text: String) -> Result[wire.Folded, String] =
+  if kind == "anthropic" then wire_anthropic.fold(text, schema_tool)
+  else if kind == "gemini" then wire_gemini.fold(text)
+  else wire_openai.fold(text)
+
+// A call that ended without a response: the runtime's words for a fired limit and a
+// cancel, and anything else is the network.
+fn call_failure(e: String) -> core.LlmError =
+  if e == "request cancelled" then core.ErrCancelled
+  else match string.strip_prefix(e, "request timeout: ") {
+    some(m) => core.ErrTimeout(m),
+    none => core.ErrTransport(e),
+  }
+
+// What a finished HTTP request amounts to: the status, then the stream. The answer comes
+// with a warning when the stream ended without saying why.
+fn read_http(sh: Shape, status: Int, text: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
+  if status < 200 or status >= 300 then err(core.classify(status, text, retry_after_ms)) else read_stream(sh, text, retry_after_ms)
+
+fn read_stream(sh: Shape, text: String, retry_after_ms: Int) -> Result[(wire.Folded, List[String]), core.LlmError] =
+  match fold_as(sh.kind, sh.schema_tool, text) {
+    // An error sent inside the stream, after a 200: read like a failed reply's body.
+    err(e) => err(if string.starts_with(e, "api error: ") then core.classify(0, e, retry_after_ms) else core.ErrUnreadable(e)),
+    ok(f) => if f.finish == "" and f.content == "" and list.is_empty(f.calls) then err(core.ErrTruncated("the stream ended with no answer and no finish reason"))
+      else ok((f, if f.finish == "" then ["the stream ended without a finish reason: the answer may be cut short"] else [])),
+  }
