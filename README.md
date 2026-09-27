@@ -7,7 +7,7 @@ Multi-provider LLM client for [Almide](https://github.com/almide/almide). One in
 ```toml
 # almide.toml
 [dependencies]
-almai = { git = "https://github.com/almide-ai/almai", tag = "v0.3.1" }
+almai = { git = "https://github.com/almide-ai/almai", tag = "v0.5.0" }
 ```
 
 ## Quick start
@@ -189,8 +189,8 @@ Model ids are `PROVIDER/MODEL` or `PROVIDER:MODEL`:
 | `NAME:MODEL` | any other OpenAI-compatible service | `NAME_BASE_URL`, `NAME_API_KEY` |
 | `claude`, `claude:opus`, `cli/claude` | Claude Code's `claude -p`, on its own login | `claude` on `PATH` |
 
-- An HTTP request is a call handle of the runtime's (`http.start`, in the Almide
-  release after 0.63.1), so it can be read while it arrives, stopped at any point, and bounded in time
+- An HTTP request is a call handle of the runtime's (`http.start`, Almide
+  0.64.0 or later), so it can be read while it arrives, stopped at any point, and bounded in time
   as a whole and between bytes. `claude` runs in the background and writes to files.
   Chat requests are always streamed: a non-streamed Cloudflare request past about four
   minutes is ended with `408`. Credentials go in the request's headers, never on a
