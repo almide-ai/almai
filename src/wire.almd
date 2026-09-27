@@ -62,9 +62,13 @@ fn merge_usage(a: core.Usage, b: core.Usage) -> core.Usage =
 // ── Reading a stream ──
 
 // The JSON payloads of a server-sent-event stream: its `data:` lines, `[DONE]` and blank
-// ones left out. A body that is not a stream at all is one payload.
+// ones left out. A body that is not a stream at all is one payload. A stream may open
+// with any of its fields, or with a comment (`: ...`), which a server sends to keep a
+// slow answer's connection alive (OpenRouter's `: OPENROUTER PROCESSING`).
+let SSE_OPENINGS = ["data:", "event:", "id:", "retry:", ":"]
+
 fn payloads(text: String) -> List[String] =
-  if not string.starts_with(string.trim_start(text), "data:") and not string.starts_with(string.trim_start(text), "event:") then
+  if not list.any(SSE_OPENINGS, (o) => string.starts_with(string.trim_start(text), o)) then
     (if string.trim(text) == "" then [] else [text])
   else list.filter(list.map(list.filter(string.split(text, "\n"), (l) => string.starts_with(l, "data:")), (l) => string.trim(string.drop(l, 5))),
     (p) => p != "" and p != "[DONE]")
@@ -111,6 +115,8 @@ fn budget_for(effort: String) -> Int =
 
 test "a stream's payloads, and a body that is not one" {
   assert_eq(payloads("event: a\ndata: {\"x\":1}\n\ndata: [DONE]\n"), ["{\"x\":1}"])
+  assert_eq(payloads(": OPENROUTER PROCESSING\n\ndata: {\"x\":1}\n"), ["{\"x\":1}"])
+  assert_eq(payloads("id: 1\ndata: {\"x\":1}\n"), ["{\"x\":1}"])
   assert_eq(payloads("{\"choices\":[]}"), ["{\"choices\":[]}"])
   assert_eq(payloads(""), [])
   assert_eq(whole_lines("data: 1\ndata: 2"), "data: 1\n")
