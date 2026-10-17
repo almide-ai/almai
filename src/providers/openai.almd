@@ -3,6 +3,7 @@
 import env
 import http
 import json
+import llm
 
 type ToolCall = { id: String, name: String, arguments: String }
 type Message = {
@@ -131,8 +132,9 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
   }
 }
 
-// Streaming call. Routes through almide's `http.openai_streaming_call`
-// intrinsic which owns the SSE parsing in Rust and delivers each new
+// Streaming call. Routes through package almide/llm's
+// `llm.openai_streaming_call` (the stdlib's `http.openai_streaming_call` until
+// dialect epoch 14), which owns the SSE parsing and delivers each new
 // `delta.content` fragment to `on_text_delta` as it arrives. Returns a
 // fully assembled LLMResponse on completion (content / tool_calls /
 // usage all concatenated server-side).
@@ -149,7 +151,7 @@ effect fn call_streaming(
   on_text_delta: (String) -> Unit,
 ) -> Result[LLMResponse, String] = {
   let body_json = json.stringify(build_body(model, msgs, opts, true))
-  match http.openai_streaming_call(base_url, api_key, body_json, on_text_delta) {
+  match llm.openai_streaming_call(base_url, api_key, body_json, on_text_delta) {
     err(e) => err("streaming: " + e)
     ok(raw) => match json.parse(raw) {
       err(e) => err("streaming: parse aggregate: " + e)
