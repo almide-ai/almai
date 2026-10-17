@@ -3,6 +3,7 @@
 import env
 import http
 import json
+import llm
 
 type ToolCall = { id: String, name: String, arguments: String }
 type Message = {
@@ -147,8 +148,9 @@ fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Boo
   value.object(fields)
 }
 
-// Streaming call. Routes through almide's `http.anthropic_streaming_call`
-// intrinsic which handles the (event:/data:) SSE wire shape and
+// Streaming call. Routes through package almide/llm's
+// `llm.anthropic_streaming_call` (the stdlib's `http.anthropic_streaming_call`
+// until dialect epoch 14), which handles the (event:/data:) SSE wire shape and
 // content_block_start / content_block_delta / message_delta accumulation.
 // Returns the same shape as `openai.call_streaming`.
 effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, on_text_delta: (String) -> Unit) -> Result[LLMResponse, String] =
@@ -156,7 +158,7 @@ effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, 
     err(e) => err(e)
     ok(api_key) => {
       let body_json = json.stringify(build_body(model, msgs, opts, true))
-      match http.anthropic_streaming_call(api_key, body_json, on_text_delta) {
+      match llm.anthropic_streaming_call(api_key, body_json, on_text_delta) {
         err(e) => err("anthropic streaming: " + e)
         ok(raw) => match json.parse(raw) {
           err(e) => err("anthropic streaming: parse aggregate: " + e)
