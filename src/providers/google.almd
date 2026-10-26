@@ -43,23 +43,23 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
       let all_msgs = sys_msgs + msgs
       let parts = list.map(all_msgs, (m) =>
-        value.object([("role", value.str(if m.role == "assistant" then "model" else "user")),
-          ("parts", value.array([value.object([("text", value.str(m.content))])]))])
+        value.object([("role", value.string(if m.role == "assistant" then "model" else "user")),
+          ("parts", value.array([value.object([("text", value.string(m.content))])]))])
       )
       let url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + api_key
       let body = json.stringify(value.object([("contents", value.array(parts)),
         ("generationConfig", value.object([("maxOutputTokens", value.int(opts.max_tokens))]))]))
-      match http.request("POST", url, body, ["Content-Type": "application/json"]) {
+      match http.request("POST", url, body, [("Content-Type", "application/json")]) {
         err(e) => err("google: http: " + e)
         ok(raw) => match json.parse(raw) {
           err(e) => err("google: json: " + e)
           ok(parsed) => {
-            let content = json.get_array(parsed, "candidates")
+            let content = value.get_array(parsed, "candidates")
               |> option.flat_map((cands) => list.first(cands))
-              |> option.flat_map((c) => value.field(c, "content")?)
-              |> option.flat_map((ct) => json.get_array(ct, "parts"))
+              |> option.flat_map((c) => value.get(c, "content"))
+              |> option.flat_map((ct) => value.get_array(ct, "parts"))
               |> option.flat_map((ps) => list.first(ps))
-              |> option.flat_map((p) => json.get_string(p, "text"))
+              |> option.flat_map((p) => value.get_string(p, "text"))
               |> option.unwrap_or("")
             ok(LLMResponse { content: string.trim(content), model: model,
               usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },

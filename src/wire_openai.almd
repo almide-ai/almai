@@ -18,20 +18,20 @@ import self.wire as wire
 // decides.
 fn encode(ask: wire.Ask) -> wire.Encoded = {
   var fields = [
-    ("model", value.str(ask.model_id)),
+    ("model", value.string(ask.model_id)),
     ("messages", value.array(ask.messages)),
     ("stream", value.bool(true)),
   ]
   if not list.is_empty(ask.tools) then list.push(fields, ("tools", value.array(ask.tools)))
   if ask.provider == "cf" or ask.provider == "openai" then list.push(fields, ("max_completion_tokens", value.int(ask.max_tokens)))
   else list.push(fields, ("max_tokens", value.int(ask.max_tokens)))
-  if ask.effort != "" then list.push(fields, ("reasoning_effort", value.str(ask.effort)))
+  if ask.effort != "" then list.push(fields, ("reasoning_effort", value.string(ask.effort)))
   if ask.provider != "cf" then list.push(fields, ("stream_options", value.object([("include_usage", value.bool(true))])))
   if ask.provider == "openrouter" then list.push(fields, ("usage", value.object([("include", value.bool(true))])))
   match ask.schema {
     some(s) => list.push(fields, ("response_format", value.object([
-      ("type", value.str("json_schema")),
-      ("json_schema", value.object([("name", value.str("answer")), ("strict", value.bool(true)), ("schema", s)]))]))),
+      ("type", value.string("json_schema")),
+      ("json_schema", value.object([("name", value.string("answer")), ("strict", value.bool(true)), ("schema", s)]))]))),
     none => (),
   }
   wire.Encoded { body: json.stringify(value.object(fields)), warnings: [] }
@@ -42,13 +42,13 @@ fn first_some(a: String?, b: String?) -> String? = match a { some(_) => a, none 
 // A tool call arrives in pieces: the first chunk for an index carries its id and name,
 // later ones carry more of the arguments.
 fn merge_call(calls: List[wire.ToolCall], d: Value) -> List[wire.ToolCall] = {
-  let i = json.get_int(d, "index") ?? list.len(calls)
+  let i = value.get_int(d, "index") ?? list.len(calls)
   var out = calls
   while list.len(out) <= i { list.push(out, wire.ToolCall { id: "", name: "", arguments: "" }) }
-  let f = value.field(d, "function") ?? value.object([])
-  let id = json.get_string(d, "id") ?? ""
-  let name = json.get_string(f, "name") ?? ""
-  let args = json.get_string(f, "arguments") ?? ""
+  let f = value.get(d, "function") ?? value.object([])
+  let id = value.get_string(d, "id") ?? ""
+  let name = value.get_string(f, "name") ?? ""
+  let args = value.get_string(f, "arguments") ?? ""
   list.update(out, i, (c) => wire.ToolCall {
     id: if c.id == "" then id else c.id,
     name: if c.name == "" then name else c.name,
@@ -57,12 +57,12 @@ fn merge_call(calls: List[wire.ToolCall], d: Value) -> List[wire.ToolCall] = {
 }
 
 fn fold_delta(acc: wire.Folded, c: Value) -> wire.Folded = {
-  let delta = value.field(c, "delta") ?? (value.field(c, "message") ?? value.object([]))
+  let delta = value.get(c, "delta") ?? (value.get(c, "message") ?? value.object([]))
   var calls = acc.calls
-  for d in json.get_array(delta, "tool_calls") ?? [] { calls = merge_call(calls, d) }
-  wire.Folded { content: acc.content + (json.get_string(delta, "content") ?? ""),
-    reasoning: acc.reasoning + (first_some(json.get_string(delta, "reasoning_content"), json.get_string(delta, "reasoning")) ?? ""),
-    calls: calls, finish: json.get_string(c, "finish_reason") ?? acc.finish, usage: acc.usage, meter: acc.meter }
+  for d in value.get_array(delta, "tool_calls") ?? [] { calls = merge_call(calls, d) }
+  wire.Folded { content: acc.content + (value.get_string(delta, "content") ?? ""),
+    reasoning: acc.reasoning + (first_some(value.get_string(delta, "reasoning_content"), value.get_string(delta, "reasoning")) ?? ""),
+    calls: calls, finish: value.get_string(c, "finish_reason") ?? acc.finish, usage: acc.usage, meter: acc.meter }
 }
 
 let NEURON_USD = 0.011 / 1000.0
@@ -83,21 +83,21 @@ fn usage_of(u: Value?) -> core.Usage = match u {
 
 // The provider's own meter: Cloudflare's neurons, or OpenRouter's usage.cost.
 fn meter_of(u: Value) -> Float = {
-  let neurons = json.get_float(u, "neurons") ?? float.from_int(json.get_int(u, "neurons") ?? -1)
+  let neurons = value.get_float(u, "neurons") ?? float.from(value.get_int(u, "neurons") ?? -1)
   if neurons >= 0.0 then neurons * NEURON_USD
-  else json.get_float(u, "cost") ?? float.from_int(json.get_int(u, "cost") ?? -1)
+  else value.get_float(u, "cost") ?? float.from(value.get_int(u, "cost") ?? -1)
 }
 
 // Mid-stream chunks can carry partial usage; the fullest one is kept.
 fn fold_chunk(acc: wire.Folded, chunk: Value) -> wire.Folded = {
-  let choice = option.map(json.get_array(chunk, "choices"), (cs) => list.first(cs)) |> option.flatten
+  let choice = option.map(value.get_array(chunk, "choices"), (cs) => list.first(cs)) |> option.flatten
   let folded = match choice { some(c) => fold_delta(acc, c), none => acc }
-  match value.field(chunk, "usage") {
-    ok(u) => if core.count(wire.opt_num(some(u), "completion_tokens")) >= core.count(folded.usage.output)
+  match value.get(chunk, "usage") {
+    some(u) => if core.count(wire.opt_num(some(u), "completion_tokens")) >= core.count(folded.usage.output)
       then wire.Folded { content: folded.content, reasoning: folded.reasoning, calls: folded.calls, finish: folded.finish,
         usage: usage_of(some(u)), meter: meter_of(u) }
       else folded,
-    err(_) => folded,
+    none => folded,
   }
 }
 
@@ -111,9 +111,9 @@ fn fold(text: String) -> Result[wire.Folded, String] = {
     if failure == "" then {
       match json.parse(p) {
         err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
-        ok(chunk) => match value.field(chunk, "error") {
-          ok(e) => { failure = "api error: " + json.stringify(e) },
-          err(_) => { acc = fold_chunk(acc, chunk) },
+        ok(chunk) => match value.get(chunk, "error") {
+          some(e) => { failure = "api error: " + json.stringify(e) },
+          none => { acc = fold_chunk(acc, chunk) },
         },
       }
     }
@@ -131,7 +131,7 @@ test "each service gets the fields it reads" {
   assert(not string.contains(oa, "reasoning_effort") and string.contains(oa, "max_completion_tokens") and string.contains(oa, "include_usage"))
   assert(string.contains(encode(ask_of("groq", "low", none)).body, "\"max_tokens\":100"))
   assert(string.contains(encode(ask_of("openrouter", "", none)).body, "\"usage\":{\"include\":true}"))
-  assert(string.contains(encode(ask_of("cf", "", some(value.object([("type", value.str("object"))])))).body, "\"json_schema\""))
+  assert(string.contains(encode(ask_of("cf", "", some(value.object([("type", value.string("object"))])))).body, "\"json_schema\""))
 }
 
 test "tool calls are put back together from their pieces" {

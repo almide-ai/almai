@@ -17,11 +17,11 @@ import json
 import self.core as core
 import self.wire as wire
 
-fn text_part(text: String) -> Value = value.object([("text", value.str(text))])
+fn text_part(text: String) -> Value = value.object([("text", value.string(text))])
 
 fn call_part(c: Value) -> Value = {
-  let f = value.field(c, "function") ?? value.object([])
-  value.object([("functionCall", value.object([("name", value.str(wire.str_of(f, "name"))), ("args", wire.arguments_object(wire.str_of(f, "arguments")))]))])
+  let f = value.get(c, "function") ?? value.object([])
+  value.object([("functionCall", value.object([("name", value.string(wire.str_of(f, "name"))), ("args", wire.arguments_object(wire.str_of(f, "arguments")))]))])
 }
 
 // One OpenAI-shaped message as (role, parts); a system message is none. `all` is the whole
@@ -31,20 +31,20 @@ fn turn_of(m: Value, all: List[Value]) -> (String, List[Value])? = {
   let text = wire.str_of(m, "content")
   if role == "system" then none
   else if role == "tool" then some(("user", [value.object([("functionResponse", value.object([
-    ("name", value.str(wire.call_name(all, wire.str_of(m, "tool_call_id")))),
-    ("response", value.object([("content", value.str(text))]))]))])]))
+    ("name", value.string(wire.call_name(all, wire.str_of(m, "tool_call_id")))),
+    ("response", value.object([("content", value.string(text))]))]))])]))
   else if role == "assistant" then some(("model", (if text == "" then [] else [text_part(text)])
-    + list.map(json.get_array(m, "tool_calls") ?? [], call_part)))
+    + list.map(value.get_array(m, "tool_calls") ?? [], call_part)))
   else some(("user", if text == "" then [] else [text_part(text)]))
 }
 
 fn contents_of(messages: List[Value]) -> List[Value] =
-  list.map(wire.merge_turns(list.filter_map(messages, (m) => turn_of(m, messages))), (t) => value.object([("role", value.str(t.0)), ("parts", value.array(t.1))]))
+  list.map(wire.merge_turns(list.filter_map(messages, (m) => turn_of(m, messages))), (t) => value.object([("role", value.string(t.0)), ("parts", value.array(t.1))]))
 
 fn declarations_of(tools: List[Value]) -> List[Value] = list.map(tools, (t) => {
-  let f = value.field(t, "function") ?? value.object([])
-  value.object([("name", value.str(wire.str_of(f, "name"))), ("description", value.str(wire.str_of(f, "description"))),
-    ("parametersJsonSchema", value.field(f, "parameters") ?? value.object([("type", value.str("object"))]))])
+  let f = value.get(t, "function") ?? value.object([])
+  value.object([("name", value.string(wire.str_of(f, "name"))), ("description", value.string(wire.str_of(f, "description"))),
+    ("parametersJsonSchema", value.get(f, "parameters") ?? value.object([("type", value.string("object"))]))])
 })
 
 fn encode(ask: wire.Ask) -> wire.Encoded = {
@@ -53,7 +53,7 @@ fn encode(ask: wire.Ask) -> wire.Encoded = {
   var config = [("maxOutputTokens", value.int(ask.max_tokens))]
   match ask.schema {
     some(s) => {
-      list.push(config, ("responseMimeType", value.str("application/json")))
+      list.push(config, ("responseMimeType", value.string("application/json")))
       list.push(config, ("responseJsonSchema", s))
     },
     none => (),
@@ -80,30 +80,30 @@ fn usage_of(u: Value?) -> core.Usage = match u {
   },
 }
 
-fn add_part(f: wire.Folded, p: Value) -> wire.Folded = match value.field(p, "functionCall") {
-  ok(c) => {
+fn add_part(f: wire.Folded, p: Value) -> wire.Folded = match value.get(p, "functionCall") {
+  some(c) => {
     let id = wire.str_of(c, "id")
     wire.Folded { content: f.content, reasoning: f.reasoning, finish: f.finish, usage: f.usage, meter: f.meter,
       calls: f.calls + [wire.ToolCall { id: if id == "" then "call_" + int.to_string(list.len(f.calls) + 1) else id, name: wire.str_of(c, "name"),
-        arguments: json.stringify(value.field(c, "args") ?? value.object([])) }] }
+        arguments: json.stringify(value.get(c, "args") ?? value.object([])) }] }
   },
-  err(_) => if json.get_bool(p, "thought") ?? false
+  none => if value.get_bool(p, "thought") ?? false
     then wire.Folded { content: f.content, reasoning: f.reasoning + wire.str_of(p, "text"), calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter }
     else wire.Folded { content: f.content + wire.str_of(p, "text"), reasoning: f.reasoning, calls: f.calls, finish: f.finish, usage: f.usage, meter: f.meter },
 }
 
 fn fold_event(acc: wire.Folded, ev: Value) -> wire.Folded = {
   var f = acc
-  match option.map(json.get_array(ev, "candidates"), (cs) => list.first(cs)) |> option.flatten {
+  match option.map(value.get_array(ev, "candidates"), (cs) => list.first(cs)) |> option.flatten {
     some(c) => {
-      for p in json.get_array(value.field(c, "content") ?? value.object([]), "parts") ?? [] { f = add_part(f, p) }
+      for p in value.get_array(value.get(c, "content") ?? value.object([]), "parts") ?? [] { f = add_part(f, p) }
       let finish = wire.str_of(c, "finishReason")
       if finish != "" then { f = wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: finish, usage: f.usage, meter: f.meter } }
     },
     none => (),
   }
   // A prompt blocked before any candidate: the reason is the finish.
-  let blocked = wire.str_of(value.field(ev, "promptFeedback") ?? value.object([]), "blockReason")
+  let blocked = wire.str_of(value.get(ev, "promptFeedback") ?? value.object([]), "blockReason")
   let usage = wire.field_of(some(ev), "usageMetadata")
   wire.Folded { content: f.content, reasoning: f.reasoning, calls: f.calls, finish: if blocked != "" then "SAFETY" else f.finish,
     usage: match usage { some(_) => usage_of(usage), none => f.usage }, meter: f.meter }
@@ -116,9 +116,9 @@ fn fold(text: String) -> Result[wire.Folded, String] = {
     if failure == "" then {
       match json.parse(p) {
         err(e) => { failure = "unreadable answer: " + e + "; raw: " + string.take(p, 200) },
-        ok(ev) => match value.field(ev, "error") {
-          ok(e) => { failure = "api error: " + json.stringify(e) },
-          err(_) => { acc = fold_event(acc, ev) },
+        ok(ev) => match value.get(ev, "error") {
+          some(e) => { failure = "api error: " + json.stringify(e) },
+          none => { acc = fold_event(acc, ev) },
         },
       }
     }
@@ -126,19 +126,19 @@ fn fold(text: String) -> Result[wire.Folded, String] = {
   if failure != "" then err(failure) else ok(acc)
 }
 
-fn msg(role: String, content: String) -> Value = value.object([("role", value.str(role)), ("content", value.str(content))])
+fn msg(role: String, content: String) -> Value = value.object([("role", value.string(role)), ("content", value.string(content))])
 
 test "a conversation goes out as contents: system apart, model turns, results named after their calls" {
-  let call = value.object([("id", value.str("c1")), ("type", value.str("function")),
-    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))])
+  let call = value.object([("id", value.string("c1")), ("type", value.string("function")),
+    ("function", value.object([("name", value.string("read")), ("arguments", value.string("{\"path\":\"a.py\"}"))]))])
   let ms = [msg("system", "be brief"), msg("user", "fix a.py"),
-    value.object([("role", value.str("assistant")), ("content", value.str("")), ("tool_calls", value.array([call]))]),
-    value.object([("role", value.str("tool")), ("tool_call_id", value.str("c1")), ("content", value.str("1 x = 1"))])]
-  let tool = value.object([("type", value.str("function")), ("function", value.object([("name", value.str("read")), ("description", value.str("read a file")),
-    ("parameters", value.object([("type", value.str("object"))]))]))])
+    value.object([("role", value.string("assistant")), ("content", value.string("")), ("tool_calls", value.array([call]))]),
+    value.object([("role", value.string("tool")), ("tool_call_id", value.string("c1")), ("content", value.string("1 x = 1"))])]
+  let tool = value.object([("type", value.string("function")), ("function", value.object([("name", value.string("read")), ("description", value.string("read a file")),
+    ("parameters", value.object([("type", value.string("object"))]))]))])
   let e = encode(wire.Ask { model_id: "gemini-2.5-flash", provider: "gemini", messages: ms, tools: [tool], max_tokens: 2000, effort: "low", schema: none })
   let body = json.parse(e.body) ?? value.object([])
-  let turns = json.get_array(body, "contents") ?? []
+  let turns = value.get_array(body, "contents") ?? []
   assert_eq(list.map(turns, (t) => wire.str_of(t, "role")), ["user", "model", "user"])
   assert(string.contains(e.body, "\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.py\"}}"))
   assert(string.contains(e.body, "\"functionResponse\":{\"name\":\"read\",\"response\":{\"content\":\"1 x = 1\"}}"))

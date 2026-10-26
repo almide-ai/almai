@@ -64,8 +64,8 @@ fn price_of(ep: Endpoint) -> Price? =
 fn cost_of(meter: Float, usage: core.Usage, ep: Endpoint) -> core.Cost =
   if meter >= 0.0 then core.Cost { usd: meter, source: "provider" }
   else match price_of(ep) {
-    some(p) => core.Cost { usd: (float.from_int(core.count(usage.input)) * p.input + float.from_int(core.count(usage.cache_read)) * p.cached
-      + float.from_int(core.count(usage.output)) * p.output) / 1000000.0, source: "table" },
+    some(p) => core.Cost { usd: (float.from(core.count(usage.input)) * p.input + float.from(core.count(usage.cache_read)) * p.cached
+      + float.from(core.count(usage.output)) * p.output) / 1000000.0, source: "table" },
     none => core.no_cost(),
   }
 

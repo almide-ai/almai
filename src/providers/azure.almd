@@ -34,20 +34,20 @@ fn sampling_of(opts: CallOptions) -> Sampling =
 
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) =>
-    value.object([("role", value.str(m.role)), ("content", value.str(m.content))])))
+    value.object([("role", value.string(m.role)), ("content", value.string(m.content))])))
 
 fn tools_to_json(ts: List[Tool]) -> Value =
   value.array(list.map(ts, (t) =>
-    value.object([("type", value.str("function")), ("function", value.object([
-      ("name", value.str(t.name)), ("description", value.str(t.description)), ("parameters", t.parameters)]))])))
+    value.object([("type", value.string("function")), ("function", value.object([
+      ("name", value.string(t.name)), ("description", value.string(t.description)), ("parameters", t.parameters)]))])))
 
 fn parse_tool_calls(msg: Value) -> List[ToolCall] =
-  json.get_array(msg, "tool_calls") |> option.unwrap_or([])
+  value.get_array(msg, "tool_calls") |> option.unwrap_or([])
     |> list.filter_map((tc) => {
-      let func = value.field(tc, "function")? |> option.unwrap_or(value.null())
-      let name = json.get_string(func, "name") |> option.unwrap_or("")
-      if name != "" then some(ToolCall { id: json.get_string(tc, "id") |> option.unwrap_or(""),
-        name: name, arguments: json.get_string(func, "arguments") |> option.unwrap_or("{}") }) else none
+      let func = value.get(tc, "function") |> option.unwrap_or(value.null())
+      let name = value.get_string(func, "name") |> option.unwrap_or("")
+      if name != "" then some(ToolCall { id: value.get_string(tc, "id") |> option.unwrap_or(""),
+        name: name, arguments: value.get_string(func, "arguments") |> option.unwrap_or("{}") }) else none
     })
 
 effect fn require_env(key: String) -> Result[String, String] =
@@ -60,20 +60,20 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
   let url = endpoint + "/openai/deployments/" + model + "/chat/completions?api-version=2024-06-01"
   let fields = [("messages", messages_to_json(sys_msgs + msgs)), ("max_tokens", value.int(opts.max_tokens))]
   let fields = if not list.is_empty(opts.tools) then fields + [("tools", tools_to_json(opts.tools))] else fields
-  let raw = http.request("POST", url, json.stringify(value.object(fields)), ["api-key": api_key, "Content-Type": "application/json"])
+  let raw = http.request("POST", url, json.stringify(value.object(fields)), [("api-key", api_key), ("Content-Type", "application/json")])
     |> result.map_err((e) => "azure: http: " + e)!
   let parsed = json.parse(raw) |> result.map_err((e) => "azure: json: " + e)!
   ok(response_of(parsed, model, opts))
 }
 
 fn response_of(parsed: Value, model: String, opts: CallOptions) -> LLMResponse = {
-  let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
-  let msg = value.field(choice, "message")? |> option.unwrap_or(value.null())
-  let u = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
-  LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
-    model: model, usage: Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
-      completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
-      total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) },
-    finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"),
+  let choice = value.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
+  let msg = value.get(choice, "message") |> option.unwrap_or(value.null())
+  let u = value.get(parsed, "usage") |> option.unwrap_or(value.null())
+  LLMResponse { content: string.trim(value.get_string(msg, "content") |> option.unwrap_or("")),
+    model: model, usage: Usage { prompt_tokens: value.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
+      completion_tokens: value.get_int(u, "completion_tokens") |> option.unwrap_or(0),
+      total_tokens: value.get_int(u, "total_tokens") |> option.unwrap_or(0) },
+    finish_reason: value.get_string(choice, "finish_reason") |> option.unwrap_or("stop"),
     tool_calls: parse_tool_calls(msg), sampling: sampling_of(opts) }
 }

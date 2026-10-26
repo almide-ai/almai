@@ -126,14 +126,14 @@ let weather_tool = Tool {
   name: "get_weather",
   description: "Get current weather for a city",
   parameters: value.object([
-    ("type", value.str("object")),
+    ("type", value.string("object")),
     ("properties", value.object([
       ("city", value.object([
-        ("type", value.str("string")),
-        ("description", value.str("City name")),
+        ("type", value.string("string")),
+        ("description", value.string("City name")),
       ])),
     ])),
-    ("required", value.array([value.str("city")])),
+    ("required", value.array([value.string("city")])),
   ]),
 }
 

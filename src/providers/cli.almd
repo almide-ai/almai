@@ -95,9 +95,9 @@ fn render_history(msgs: List[Message]) -> String = {
 // all, so there is genuinely nothing to read and "" is the honest answer there
 // too.
 fn claude_finish_reason(v: Value) -> String =
-  match json.get_string(v, "subtype") {
+  match value.get_string(v, "subtype") {
     some(s) => if s == "success" then "stop" else s,
-    none => if json.get_bool(v, "is_error") ?? false then "error" else "",
+    none => if value.get_bool(v, "is_error") ?? false then "error" else "",
   }
 
 // Parse a `claude --output-format json` response, falling back to
@@ -111,11 +111,11 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
       finish_reason: "", tool_calls: [], sampling: nothing_sent(),
     }
     ok(v) => {
-      let result_text = json.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
-      let usage_obj = value.field(v, "usage")? |> option.unwrap_or(value.null())
-      let in_tok  = json.get_int(usage_obj, "input_tokens")  |> option.unwrap_or(0)
-      let out_tok = json.get_int(usage_obj, "output_tokens") |> option.unwrap_or(0)
-      let model = json.get_string(v, "session_id") |> option.unwrap_or("claude-cli")
+      let result_text = value.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
+      let usage_obj = value.get(v, "usage") |> option.unwrap_or(value.null())
+      let in_tok  = value.get_int(usage_obj, "input_tokens")  |> option.unwrap_or(0)
+      let out_tok = value.get_int(usage_obj, "output_tokens") |> option.unwrap_or(0)
+      let model = value.get_string(v, "session_id") |> option.unwrap_or("claude-cli")
       LLMResponse {
         content: string.trim(result_text), model: model,
         usage: Usage { prompt_tokens: in_tok, completion_tokens: out_tok, total_tokens: in_tok + out_tok },

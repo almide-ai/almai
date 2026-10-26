@@ -52,7 +52,7 @@ type Tool = { name: String, description: String, parameters: Value }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) =>
-    value.object([("role", value.str(m.role)), ("content", value.str(m.content))])))
+    value.object([("role", value.string(m.role)), ("content", value.string(m.content))])))
 
 // ── Sampling ──
 //
@@ -161,15 +161,15 @@ effect fn resolve_account() -> Result[String, String] =
 // the chat shape. A provider that gains a third shape gets another arm here,
 // not a second reader somewhere else.
 fn completion_text(parsed: Value) -> Option[String] =
-  match value.field(parsed, "result")? {
+  match value.get(parsed, "result") {
     none => none,
-    some(r) => match json.get_string(r, "response") {
+    some(r) => match value.get_string(r, "response") {
       some(t) => some(t),
       none => {
-        let choices = json.get_array(r, "choices") ?? []
+        let choices = value.get_array(r, "choices") ?? []
         list.first(choices)
-          |> option.flat_map((c) => value.field(c, "message")?)
-          |> option.flat_map((m) => json.get_string(m, "content"))
+          |> option.flat_map((c) => value.get(c, "message"))
+          |> option.flat_map((m) => value.get_string(m, "content"))
       },
     },
   }
@@ -187,11 +187,11 @@ fn completion_text(parsed: Value) -> Option[String] =
 // is "" — not reported — never the good case. Defaulting an unknown to
 // "stop" is the same sentence the constant was.
 fn finish_reason_of(parsed: Value) -> String =
-  (match value.field(parsed, "result")? {
+  (match value.get(parsed, "result") {
     none => none,
     some(r) =>
-      list.first(json.get_array(r, "choices") ?? [])
-        |> option.flat_map((c) => json.get_string(c, "finish_reason")),
+      list.first(value.get_array(r, "choices") ?? [])
+        |> option.flat_map((c) => value.get_string(c, "finish_reason")),
   }) ?? ""
 
 // WHAT THE CALL COST, when Cloudflare says.
@@ -203,12 +203,12 @@ fn finish_reason_of(parsed: Value) -> String =
 // caller can tell the two apart by whether all three are 0 (the older shape
 // reports nothing at all).
 fn usage_of(parsed: Value) -> Usage =
-  match value.field(parsed, "result")? |> option.flat_map((r) => value.field(r, "usage")?) {
+  match value.get(parsed, "result") |> option.flat_map((r) => value.get(r, "usage")) {
     none => Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     some(u) => Usage {
-      prompt_tokens: json.get_int(u, "prompt_tokens") ?? 0,
-      completion_tokens: json.get_int(u, "completion_tokens") ?? 0,
-      total_tokens: json.get_int(u, "total_tokens") ?? 0,
+      prompt_tokens: value.get_int(u, "prompt_tokens") ?? 0,
+      completion_tokens: value.get_int(u, "completion_tokens") ?? 0,
+      total_tokens: value.get_int(u, "total_tokens") ?? 0,
     },
   }
 
@@ -225,11 +225,11 @@ fn usage_of(parsed: Value) -> Usage =
 // body, because a shape we did not anticipate is still better evidence than
 // silence.
 fn api_complaint(parsed: Value, raw: String) -> String = {
-  let items = json.get_array(parsed, "errors") ?? []
+  let items = value.get_array(parsed, "errors") ?? []
   let errs = items |> list.filter_map((e) =>
-    match json.get_string(e, "message") {
+    match value.get_string(e, "message") {
       none => none,
-      some(m) => match json.get_int(e, "code") {
+      some(m) => match value.get_int(e, "code") {
         some(c) => some("[" + int.to_string(c) + "] " + m),
         none => some(m),
       },
@@ -244,7 +244,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
   let email = require_env("CLOUDFLARE_EMAIL") |> result.map_err((_) => "cloudflare: need CLOUDFLARE_EMAIL for Global API Key auth")!
   let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
   let body = json.stringify(build_body(msgs, opts))
-  let raw = http.request("POST", url, body, ["X-Auth-Key": api_key, "X-Auth-Email": email, "Content-Type": "application/json"])
+  let raw = http.request("POST", url, body, [("X-Auth-Key", api_key), ("X-Auth-Email", email), ("Content-Type", "application/json")])
     |> result.map_err((e) => "cloudflare: http: " + e)!
   let parsed = json.parse(raw) |> result.map_err((e) => "cloudflare: json: " + e)!
   match completion_text(parsed) {

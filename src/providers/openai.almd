@@ -45,24 +45,24 @@ fn sampling_of(opts: CallOptions) -> Sampling =
 //   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
 fn tool_call_to_json(tc: ToolCall) -> Value =
   value.object([
-    ("id", value.str(tc.id)),
-    ("type", value.str("function")),
+    ("id", value.string(tc.id)),
+    ("type", value.string("function")),
     ("function", value.object([
-      ("name", value.str(tc.name)),
-      ("arguments", value.str(tc.arguments)),
+      ("name", value.string(tc.name)),
+      ("arguments", value.string(tc.arguments)),
     ])),
   ])
 
 fn message_to_json(m: Message) -> Value = {
   // Base shape — every message has role + content
-  let base = [("role", value.str(m.role)), ("content", value.str(m.content))]
+  let base = [("role", value.string(m.role)), ("content", value.string(m.content))]
   // role:"assistant" with tool_calls → emit `tool_calls` array
   let with_tool_calls = if m.role == "assistant" and not list.is_empty(m.tool_calls) then
     base + [("tool_calls", value.array(list.map(m.tool_calls, (tc) => tool_call_to_json(tc))))]
   else base
   // role:"tool" requires `tool_call_id` to correlate with the assistant call
   let with_id = if m.role == "tool" and m.tool_call_id != "" then
-    with_tool_calls + [("tool_call_id", value.str(m.tool_call_id))]
+    with_tool_calls + [("tool_call_id", value.string(m.tool_call_id))]
   else with_tool_calls
   value.object(with_id)
 }
@@ -72,32 +72,32 @@ fn messages_to_json(msgs: List[Message]) -> Value =
 
 fn tools_to_json(ts: List[Tool]) -> Value =
   value.array(list.map(ts, (t) =>
-    value.object([("type", value.str("function")), ("function", value.object([
-      ("name", value.str(t.name)), ("description", value.str(t.description)), ("parameters", t.parameters)]))])))
+    value.object([("type", value.string("function")), ("function", value.object([
+      ("name", value.string(t.name)), ("description", value.string(t.description)), ("parameters", t.parameters)]))])))
 
 fn parse_tool_calls(msg: Value) -> List[ToolCall] =
-  json.get_array(msg, "tool_calls") |> option.unwrap_or([])
+  value.get_array(msg, "tool_calls") |> option.unwrap_or([])
     |> list.filter_map((tc) => {
-      let id = json.get_string(tc, "id") |> option.unwrap_or("")
-      let func = value.field(tc, "function")? |> option.unwrap_or(value.null())
-      let name = json.get_string(func, "name") |> option.unwrap_or("")
-      let args = json.get_string(func, "arguments") |> option.unwrap_or("{}")
+      let id = value.get_string(tc, "id") |> option.unwrap_or("")
+      let func = value.get(tc, "function") |> option.unwrap_or(value.null())
+      let name = value.get_string(func, "name") |> option.unwrap_or("")
+      let args = value.get_string(func, "arguments") |> option.unwrap_or("{}")
       if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
     })
 
 fn parse_usage(v: Value) -> Usage = {
-  let u = value.field(v, "usage")? |> option.unwrap_or(value.null())
-  Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
-    completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
-    total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) }
+  let u = value.get(v, "usage") |> option.unwrap_or(value.null())
+  Usage { prompt_tokens: value.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
+    completion_tokens: value.get_int(u, "completion_tokens") |> option.unwrap_or(0),
+    total_tokens: value.get_int(u, "total_tokens") |> option.unwrap_or(0) }
 }
 
 effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> Result[Value, String] =
-  match http.request("POST", url, json.stringify(body), headers) {
+  match http.request("POST", url, json.stringify(body), map.to_list(headers)) {
     err(e) => err("http: " + e)
     ok(raw) => match json.parse(raw) {
       err(e) => err("json: " + e + " raw: " + string.take(raw, 200))
-      ok(parsed) => match value.field(parsed, "error")? |> option.flat_map((e) => json.get_string(e, "message")) {
+      ok(parsed) => match value.get(parsed, "error") |> option.flat_map((e) => value.get_string(e, "message")) {
         some(msg) => err("api: " + msg)
         none => ok(parsed)
       }
@@ -108,11 +108,11 @@ effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> R
 fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> Value = {
   let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
   let all_msgs = sys_msgs + msgs
-  let fields = [("model", value.str(model)), ("messages", messages_to_json(all_msgs)),
+  let fields = [("model", value.string(model)), ("messages", messages_to_json(all_msgs)),
     ("max_tokens", value.int(opts.max_tokens)), ("temperature", value.float(opts.temperature))]
   let fields = if not list.is_empty(opts.tools) then fields + [("tools", tools_to_json(opts.tools))] else fields
-  let fields = if opts.json_mode then fields + [("response_format", value.object([("type", value.str("json_object"))]))] else fields
-  let fields = if not list.is_empty(opts.stop) then fields + [("stop", value.array(list.map(opts.stop, (s) => value.str(s))))] else fields
+  let fields = if opts.json_mode then fields + [("response_format", value.object([("type", value.string("json_object"))]))] else fields
+  let fields = if not list.is_empty(opts.stop) then fields + [("stop", value.array(list.map(opts.stop, (s) => value.string(s))))] else fields
   let fields = if stream then fields + [("stream", value.bool(true))] else fields
   value.object(fields)
 }
@@ -122,11 +122,11 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
   match post_json(base_url + "/chat/completions", body, ["Authorization": "Bearer " + api_key, "Content-Type": "application/json"]) {
     err(e) => err(e)
     ok(parsed) => {
-      let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
-      let msg = value.field(choice, "message")? |> option.unwrap_or(value.null())
-      ok(LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
-        model: json.get_string(parsed, "model") |> option.unwrap_or(""), usage: parse_usage(parsed),
-        finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg),
+      let choice = value.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
+      let msg = value.get(choice, "message") |> option.unwrap_or(value.null())
+      ok(LLMResponse { content: string.trim(value.get_string(msg, "content") |> option.unwrap_or("")),
+        model: value.get_string(parsed, "model") |> option.unwrap_or(""), usage: parse_usage(parsed),
+        finish_reason: value.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg),
         sampling: sampling_of(opts) })
     }
   }
@@ -156,23 +156,23 @@ effect fn call_streaming(
     ok(raw) => match json.parse(raw) {
       err(e) => err("streaming: parse aggregate: " + e)
       ok(parsed) => {
-        let tool_calls_arr = json.get_array(parsed, "tool_calls") |> option.unwrap_or([])
+        let tool_calls_arr = value.get_array(parsed, "tool_calls") |> option.unwrap_or([])
         let tool_calls = tool_calls_arr |> list.filter_map((tc) => {
-          let id = json.get_string(tc, "id") |> option.unwrap_or("")
-          let name = json.get_string(tc, "name") |> option.unwrap_or("")
-          let args = json.get_string(tc, "arguments") |> option.unwrap_or("{}")
+          let id = value.get_string(tc, "id") |> option.unwrap_or("")
+          let name = value.get_string(tc, "name") |> option.unwrap_or("")
+          let args = value.get_string(tc, "arguments") |> option.unwrap_or("{}")
           if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
         })
-        let usage_obj = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
+        let usage_obj = value.get(parsed, "usage") |> option.unwrap_or(value.null())
         ok(LLMResponse {
-          content: json.get_string(parsed, "content") |> option.unwrap_or(""),
-          model: json.get_string(parsed, "model") |> option.unwrap_or(""),
+          content: value.get_string(parsed, "content") |> option.unwrap_or(""),
+          model: value.get_string(parsed, "model") |> option.unwrap_or(""),
           usage: Usage {
-            prompt_tokens: json.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
-            completion_tokens: json.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
-            total_tokens: json.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
+            prompt_tokens: value.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
+            completion_tokens: value.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
+            total_tokens: value.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
           },
-          finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("stop"),
+          finish_reason: value.get_string(parsed, "finish_reason") |> option.unwrap_or("stop"),
           tool_calls: tool_calls,
           sampling: sampling_of(opts),
         })

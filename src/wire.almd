@@ -34,15 +34,15 @@ fn empty() -> Folded = Folded { content: "", reasoning: "", calls: [], finish: "
 
 // ── Reading JSON ──
 
-fn str_of(v: Value, key: String) -> String = json.get_string(v, key) ?? ""
+fn str_of(v: Value, key: String) -> String = value.get_string(v, key) ?? ""
 
 fn field_of(v: Value?, key: String) -> Value? = match v {
-  some(x) => match value.field(x, key) { ok(y) => some(y), err(_) => none },
+  some(x) => match value.get(x, key) { some(y) => some(y), none => none },
   none => none,
 }
 
 fn num(v: Value?, key: String) -> Int = match v {
-  some(u) => match json.get_int(u, key) { some(n) => n, none => float.to_int(json.get_float(u, key) ?? 0.0) },
+  some(u) => match value.get_int(u, key) { some(n) => n, none => int.from_saturating(value.get_float(u, key) ?? 0.0) },
   none => 0,
 }
 
@@ -80,8 +80,8 @@ fn whole_lines(s: String) -> String = match string.last_index_of(s, "\n") { some
 fn call_name(messages: List[Value], id: String) -> String = {
   var name = "tool"
   for m in messages {
-    for c in json.get_array(m, "tool_calls") ?? [] {
-      if str_of(c, "id") == id then { name = str_of(value.field(c, "function") ?? value.object([]), "name") }
+    for c in value.get_array(m, "tool_calls") ?? [] {
+      if str_of(c, "id") == id then { name = str_of(value.get(c, "function") ?? value.object([]), "name") }
     }
   }
   name
@@ -103,7 +103,7 @@ fn arguments_object(args: String) -> Value = match json.parse(if string.trim(arg
 
 // The system text of an OpenAI-shaped conversation: every system message, in order.
 fn system_of(messages: List[Value]) -> String =
-  string.join(list.map(list.filter(messages, (m) => str_of(m, "role") == "system"), (m) => str_of(m, "content")), "\n\n")
+  list.join(list.map(list.filter(messages, (m) => str_of(m, "role") == "system"), (m) => str_of(m, "content")), "\n\n")
 
 // Reasoning budgets for the formats that take a token budget rather than a level.
 fn budget_for(effort: String) -> Int =

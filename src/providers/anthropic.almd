@@ -41,9 +41,9 @@ fn sampling_of(opts: CallOptions) -> Sampling =
 
 fn tool_use_block(tc: ToolCall) -> Value =
   value.object([
-    ("type", value.str("tool_use")),
-    ("id", value.str(tc.id)),
-    ("name", value.str(tc.name)),
+    ("type", value.string("tool_use")),
+    ("id", value.string(tc.id)),
+    ("name", value.string(tc.name)),
     // `arguments` is a JSON-encoded string in our generic ToolCall;
     // Anthropic expects a JSON object. Parse if possible, fall back to {}.
     ("input", match json.parse(tc.arguments) {
@@ -53,7 +53,7 @@ fn tool_use_block(tc: ToolCall) -> Value =
   ])
 
 fn text_block(content: String) -> Value =
-  value.object([("type", value.str("text")), ("text", value.str(content))])
+  value.object([("type", value.string("text")), ("text", value.string(content))])
 
 fn assistant_blocks(m: Message) -> Value = {
   let text = if m.content != "" then [text_block(m.content)] else []
@@ -63,9 +63,9 @@ fn assistant_blocks(m: Message) -> Value = {
 
 fn tool_result_block(m: Message) -> Value =
   value.object([
-    ("type", value.str("tool_result")),
-    ("tool_use_id", value.str(m.tool_call_id)),
-    ("content", value.str(m.content)),
+    ("type", value.string("tool_result")),
+    ("tool_use_id", value.string(m.tool_call_id)),
+    ("content", value.string(m.content)),
   ])
 
 fn message_to_json(m: Message) -> Value = {
@@ -75,24 +75,24 @@ fn message_to_json(m: Message) -> Value = {
   else if m.role == "assistant" and not list.is_empty(m.tool_calls) then
     assistant_blocks(m)
   else
-    value.str(m.content)
-  value.object([("role", value.str(role)), ("content", content)])
+    value.string(m.content)
+  value.object([("role", value.string(role)), ("content", content)])
 }
 
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) => message_to_json(m)))
 
-fn es(v: Value, key: String) -> String = json.get_string(v, key) |> option.unwrap_or("")
+fn es(v: Value, key: String) -> String = value.get_string(v, key) |> option.unwrap_or("")
 
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
 
 effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> Result[Value, String] =
-  match http.request("POST", url, json.stringify(body), headers) {
+  match http.request("POST", url, json.stringify(body), map.to_list(headers)) {
     err(e) => err("http: " + e)
     ok(raw) => match json.parse(raw) {
       err(e) => err("json: " + e)
-      ok(parsed) => match value.field(parsed, "error")? |> option.flat_map((e) => json.get_string(e, "message")) {
+      ok(parsed) => match value.get(parsed, "error") |> option.flat_map((e) => value.get_string(e, "message")) {
         some(msg) => err("api: " + msg)
         none => ok(parsed)
       }
@@ -106,26 +106,26 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       let user_msgs = list.filter(msgs, (m) => m.role != "system")
       let sys = if opts.system != "" then opts.system
         else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
-      let fields = [("model", value.str(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
-      let fields = if sys != "" then fields + [("system", value.str(sys))] else fields
+      let fields = [("model", value.string(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
+      let fields = if sys != "" then fields + [("system", value.string(sys))] else fields
       let fields = if not list.is_empty(opts.tools) then
         fields + [("tools", value.array(list.map(opts.tools, (t) => value.object([
-          ("name", value.str(t.name)), ("description", value.str(t.description)), ("input_schema", t.parameters)]))))]
+          ("name", value.string(t.name)), ("description", value.string(t.description)), ("input_schema", t.parameters)]))))]
       else fields
       let body = value.object(fields)
       match post_json("https://api.anthropic.com/v1/messages", body, ["x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"]) {
         err(e) => err("anthropic: " + e)
         ok(parsed) => {
-          let blocks = json.get_array(parsed, "content") |> option.unwrap_or([])
-          let text = blocks |> list.filter_map((b) => if es(b, "type") == "text" then json.get_string(b, "text") else none) |> string.join("")
+          let blocks = value.get_array(parsed, "content") |> option.unwrap_or([])
+          let text = blocks |> list.filter_map((b) => if es(b, "type") == "text" then value.get_string(b, "text") else none) |> list.join("")
           let tc = blocks |> list.filter_map((b) =>
             if es(b, "type") == "tool_use" then some(ToolCall { id: es(b, "id"), name: es(b, "name"),
-              arguments: value.field(b, "input")? |> option.map((v) => json.stringify(v)) |> option.unwrap_or("{}") }) else none)
+              arguments: value.get(b, "input") |> option.map((v) => json.stringify(v)) |> option.unwrap_or("{}") }) else none)
           ok(LLMResponse { content: string.trim(text), model: es(parsed, "model"),
-            usage: { let u = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
-              Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
-                completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
-                total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) } },
+            usage: { let u = value.get(parsed, "usage") |> option.unwrap_or(value.null())
+              Usage { prompt_tokens: value.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
+                completion_tokens: value.get_int(u, "completion_tokens") |> option.unwrap_or(0),
+                total_tokens: value.get_int(u, "total_tokens") |> option.unwrap_or(0) } },
             finish_reason: es(parsed, "stop_reason"), tool_calls: tc, sampling: sampling_of(opts) })
         }
       }
@@ -138,11 +138,11 @@ fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Boo
   let user_msgs = list.filter(msgs, (m) => m.role != "system")
   let sys = if opts.system != "" then opts.system
     else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
-  let fields = [("model", value.str(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
-  let fields = if sys != "" then fields + [("system", value.str(sys))] else fields
+  let fields = [("model", value.string(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
+  let fields = if sys != "" then fields + [("system", value.string(sys))] else fields
   let fields = if not list.is_empty(opts.tools) then
     fields + [("tools", value.array(list.map(opts.tools, (t) => value.object([
-      ("name", value.str(t.name)), ("description", value.str(t.description)), ("input_schema", t.parameters)]))))]
+      ("name", value.string(t.name)), ("description", value.string(t.description)), ("input_schema", t.parameters)]))))]
   else fields
   let fields = if stream then fields + [("stream", value.bool(true))] else fields
   value.object(fields)
@@ -163,23 +163,23 @@ effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, 
         ok(raw) => match json.parse(raw) {
           err(e) => err("anthropic streaming: parse aggregate: " + e)
           ok(parsed) => {
-            let tool_calls_arr = json.get_array(parsed, "tool_calls") |> option.unwrap_or([])
+            let tool_calls_arr = value.get_array(parsed, "tool_calls") |> option.unwrap_or([])
             let tool_calls = tool_calls_arr |> list.filter_map((tc) => {
-              let id = json.get_string(tc, "id") |> option.unwrap_or("")
-              let name = json.get_string(tc, "name") |> option.unwrap_or("")
-              let args = json.get_string(tc, "arguments") |> option.unwrap_or("{}")
+              let id = value.get_string(tc, "id") |> option.unwrap_or("")
+              let name = value.get_string(tc, "name") |> option.unwrap_or("")
+              let args = value.get_string(tc, "arguments") |> option.unwrap_or("{}")
               if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
             })
-            let usage_obj = value.field(parsed, "usage")? |> option.unwrap_or(value.null())
+            let usage_obj = value.get(parsed, "usage") |> option.unwrap_or(value.null())
             ok(LLMResponse {
-              content: json.get_string(parsed, "content") |> option.unwrap_or(""),
-              model: json.get_string(parsed, "model") |> option.unwrap_or(""),
+              content: value.get_string(parsed, "content") |> option.unwrap_or(""),
+              model: value.get_string(parsed, "model") |> option.unwrap_or(""),
               usage: Usage {
-                prompt_tokens: json.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
-                completion_tokens: json.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
-                total_tokens: json.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
+                prompt_tokens: value.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
+                completion_tokens: value.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
+                total_tokens: value.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
               },
-              finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("end_turn"),
+              finish_reason: value.get_string(parsed, "finish_reason") |> option.unwrap_or("end_turn"),
               tool_calls: tool_calls,
               sampling: sampling_of(opts),
             })

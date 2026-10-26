@@ -62,7 +62,7 @@ fn limits() -> Limits = Limits { total_s: 900, idle_s: 120 }
 // it so far. A claude -p one is a program in the background, and its shell appends the
 // exit status to `out` when it is really finished, which is what "done" means -- the
 // stream having stopped growing does not. `id` tells a hedge from the request it copies.
-type Pending = { id: Int, call: http.HttpCall?, sh_pid: Int, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String,
+type Pending = { id: Int, call: http.HttpCall?, sh: process.ProcessChild?, pid_file: String, stream: String, cfg: String, body: String, out: String, err: String,
   t0: Int, model: String, kind: String, session: String, sent: Int, limits: Limits, tools: Bool, schema_tool: Bool, warnings: List[String] }
 
 // Where a model id goes lives in almai.route; these keep the names callers use.
@@ -96,8 +96,8 @@ fn sh_quote(s: String) -> String = "'" + string.replace(s, "'", "'\\''") + "'"
 
 effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
   let ep = endpoint(req.model) |> result.map_err((e) => core.ErrConfig(e))!
-  let fresh = Pending { id: 1, call: none, sh_pid: 0, pid_file: "", stream: temp("almai-stream")!, cfg: "", body: "", out: "", err: "",
-    t0: env.millis(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
+  let fresh = Pending { id: 1, call: none, sh: none, pid_file: "", stream: temp("almai-stream")!, cfg: "", body: "", out: "", err: "",
+    t0: datetime.now_ms(), model: req.model, kind: ep.kind, session: req.session, sent: list.len(req.messages) + 1, limits: l,
     tools: not list.is_empty(req.tools), schema_tool: ep.kind == "anthropic" and wire_anthropic.schema_as_tool(ask_of(ep, req)), warnings: [] }
   if ep.kind == "claude" then start_claude(req, ep, fresh) else start_http(req, ep, fresh)
 }
@@ -105,7 +105,7 @@ effect fn start(req: Request, l: Limits) -> Result[Pending, core.LlmError] = {
 effect fn start_http(req: Request, ep: route.Endpoint, p: Pending) -> Result[Pending, core.LlmError] = {
   let encoded = encode(ep, req)
   let limits = http.HttpLimits { total_ms: p.limits.total_s * 1000, idle_ms: p.limits.idle_s * 1000 }
-  let call = http.start("POST", ep.url, encoded.body, headers_of(ep), limits) |> result.map_err((e) => core.ErrTransport(e))!
+  let call = http.start(http.new_request("POST", ep.url, encoded.body, map.to_list(headers_of(ep))), limits) |> result.map_err((e) => core.ErrTransport(e))!
   ok({ ...p, call: some(call), warnings: encoded.warnings })
 }
 
@@ -113,7 +113,7 @@ effect fn start_http(req: Request, ep: route.Endpoint, p: Pending) -> Result[Pen
 fn headers_of(ep: route.Endpoint) -> Map[String, String] = {
   var m: Map[String, String] = ["Content-Type": "application/json"]
   for h in ep.headers {
-    match string.split_once(h, ":") { some((k, v)) => map.insert(m, string.trim(k), string.trim(v)), none => () }
+    match string.split_once(h, ":") { some((k, v)) => { m = map.set(m, string.trim(k), string.trim(v)) }, none => () }
   }
   m
 }
@@ -126,15 +126,15 @@ effect fn start_claude(req: Request, ep: route.Endpoint, p: Pending) -> Result[P
   let pid_path = temp("almai-pid")!
   let session = if req.session == "" then none else wire_claude.continuing(wire_claude.session_of(fs.read_text(req.session) ?? ""), list.len(req.messages), req.model)
   let (resume, from) = match session { some(s) => (s.id, s.sent), none => ("", 0) }
-  fs.write(body_path, wire_claude.prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
-  fs.write(cfg_path, wire_claude.system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+  fs.write_text(body_path, wire_claude.prompt(req.messages, from, resume == "")) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
+  fs.write_text(cfg_path, wire_claude.system(req.messages, req.tools)) |> result.map_err((e) => core.ErrConfig("write request: " + e))!
   // From the temp directory, so no project file of the person's is read as memory and
   // the sessions are filed apart from theirs. The program runs in the background so its
   // own pid is known: killing the shell alone would leave it running.
-  let script = "cd \"$" + "{TMPDIR:-/tmp}\" && (" + string.join(list.map(wire_claude.args(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != ""), sh_quote), " ") + ") < " + sh_quote(body_path)
+  let script = "cd \"$" + "{TMPDIR:-/tmp}\" && (" + list.join(list.map(wire_claude.args(ep.model_id, resume, cfg_path, if list.is_empty(req.tools) then req.schema else none, req.session != ""), sh_quote), " ") + ") < " + sh_quote(body_path)
     + " > " + sh_quote(p.stream) + " 2> " + sh_quote(err_path) + " & p=$!; echo $p > " + sh_quote(pid_path) + "; wait $p; " + "printf '200\\n%s\\n' \"$?\" > " + sh_quote(out_path)
-  let pid = process.spawn("sh", ["-c", script]) |> result.map_err((e) => core.ErrTransport("spawn: " + e))!
-  ok({ ...p, sh_pid: pid, pid_file: pid_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, warnings: wire_claude.warnings(ask_of(ep, req)) })
+  let shell = process.start(process.ProcessCommand { cmd: "sh", args: ["-c", script] }) |> result.map_err((e) => core.ErrTransport("spawn: " + e))!
+  ok({ ...p, sh: some(shell), pid_file: pid_path, cfg: cfg_path, body: body_path, out: out_path, err: err_path, warnings: wire_claude.warnings(ask_of(ep, req)) })
 }
 
 // `out` is the HTTP status with no newline, then the exit status on its own line.
@@ -157,7 +157,7 @@ effect fn is_done(p: Pending) -> Bool = match p.call {
 effect fn text_so_far(p: Pending) -> String = match p.call {
   none => "",
   some(c) => {
-    let _ = fs.append(p.stream, http.read_new(c))
+    let _ = fs.append_text(p.stream, http.read_new(c))
     match answer.fold_as(p.kind, p.schema_tool, wire.whole_lines(fs.read_text(p.stream) ?? "")) {
       ok(f) => f.content,
       err(_) => "",
@@ -176,10 +176,13 @@ effect fn cancel(p: Pending) -> Unit = {
     some(c) => http.cancel(c),
     none => {
       match int.parse(string.trim(fs.read_text(p.pid_file) ?? "")) {
-        ok(pid) => if process.is_alive(pid) then { let _ = process.kill(pid, 15); () },
+        ok(pid) => { let _ = process.kill(pid, 15); () },
         err(_) => (),
       }
-      if process.is_alive(p.sh_pid) then { let _ = process.kill(p.sh_pid, 15); () }
+      match p.sh {
+        some(shell) => { let _ = process.stop(shell, 1000); () },
+        none => (),
+      }
     },
   }
   clean_up(p)!
@@ -194,11 +197,11 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = match p.call {
   none => finish_claude(p),
   some(c) => {
     let answered = http.wait(c)
-    let ms = env.millis() - p.t0
+    let ms = datetime.now_ms() - p.t0
     let _ = clean_up(p)
     match answered {
       err(e) => err(answer.call_failure(e)),
-      ok(r) => match answer.read_http(answer.Shape { kind: p.kind, schema_tool: p.schema_tool }, http.status_code(r), http.body(r), core.retry_after_in(retry_headers(r))) {
+      ok(r) => match answer.read_http(answer.Shape { kind: p.kind, schema_tool: p.schema_tool }, http.status(r), http.body(r), core.retry_after_in(retry_headers(r))) {
         ok((f, cut_short)) => ok(reply_of(f, endpoint(p.model) ?? route.Endpoint { kind: "chat", provider: "", url: "", headers: [], model_id: "" }, ms,
           p.warnings + cut_short)),
         err(e) => err(e),
@@ -209,18 +212,18 @@ effect fn finish(p: Pending) -> Result[Reply, core.LlmError] = match p.call {
 
 // The two headers a rate limit's wait is read from, in core.retry_after_in's shape.
 fn retry_headers(r: HttpResponse) -> String =
-  string.join(list.filter_map(["retry-after-ms", "retry-after"], (k) => option.map(http.get_header(r, k), (v) => k + ": " + v)), "\n")
+  list.join(list.filter_map(["retry-after-ms", "retry-after"], (k) => option.map(http.header(r, k), (v) => k + ": " + v)), "\n")
 
 // claude -p's answer, and its session kept for the next call.
 effect fn finish_claude(p: Pending) -> Result[Reply, core.LlmError] = {
   let (_, code) = exit_of(fs.read_text(p.out) ?? "") ?? (0, 0)
   let text = fs.read_text(p.stream) ?? ""
   let said = string.trim(fs.read_text(p.err) ?? "")
-  let ms = env.millis() - p.t0
+  let ms = datetime.now_ms() - p.t0
   let _ = clean_up(p)
   match wire_claude.read(text, code, said, p.tools) {
     ok((f, sid)) => {
-      if p.session != "" and sid != "" then { let _ = fs.write(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () }
+      if p.session != "" and sid != "" then { let _ = fs.write_text(p.session, wire_claude.session_text(wire_claude.Session { id: sid, sent: p.sent, model: p.model })); () }
       ok(reply_of(f, route.Endpoint { kind: "claude", provider: "claude", url: "", headers: [], model_id: "" }, ms, p.warnings))
     },
     err(e) => err(e),
@@ -241,7 +244,7 @@ let POLL_MS = 250
 // same login's rate limit twice. Past `cap_ms` (0: only `limits`) both are stopped: a
 // model that keeps talking is never idle, so `idle_s` cannot catch it.
 effect fn run(req: Request, l: Limits, hedge_ms: Int, cap_ms: Int) -> Result[Ran, core.LlmError] = {
-  let t0 = env.millis()
+  let t0 = datetime.now_ms()
   let hard = (l.total_s + 30) * 1000
   let deadline = if cap_ms > 0 then int.min(cap_ms, hard) else hard
   let first = start(req, l)!
@@ -267,7 +270,7 @@ effect fn race(req: Request, l: Limits, first: Pending, hedge_at: Int, t0: Int, 
   var winner: Pending? = none
   var timed_out = false
   while option.is_none(winner) and not timed_out {
-    let waited = env.millis() - t0
+    let waited = datetime.now_ms() - t0
     winner = done_of(first, second) ?? none
     if option.is_none(winner) and option.is_none(second) and hedge_at > 0 and waited > hedge_at then { second = some({ ...start(req, l)!, id: 2 }) }
     if option.is_none(winner) then { if waited > deadline then { timed_out = true } else env.sleep_ms(POLL_MS) }
