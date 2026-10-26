@@ -7,7 +7,11 @@ Multi-provider LLM client for [Almide](https://github.com/almide/almide). One in
 ```toml
 # almide.toml
 [dependencies]
-almai = { git = "https://github.com/almide-ai/almai", tag = "v0.5.0" }
+almai = { git = "https://github.com/almide-ai/almai", tag = "v0.6.0" }
+
+# almide >= 0.69.0 fetches a git dependency only from a trusted owner
+[trust]
+owners = ["github.com/almide-ai"]
 ```
 
 ## Quick start
