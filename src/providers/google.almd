@@ -54,13 +54,12 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
         ok(raw) => match json.parse(raw) {
           err(e) => err("google: json: " + e)
           ok(parsed) => {
-            let content = value.get_array(parsed, "candidates")
+            let content = (value.get_array(parsed, "candidates")
               |> option.flat_map((cands) => list.first(cands))
               |> option.flat_map((c) => value.get(c, "content"))
               |> option.flat_map((ct) => value.get_array(ct, "parts"))
               |> option.flat_map((ps) => list.first(ps))
-              |> option.flat_map((p) => value.get_string(p, "text"))
-              |> option.unwrap_or("")
+              |> option.flat_map((p) => value.get_string(p, "text"))) ?? ""
             ok(LLMResponse { content: string.trim(content), model: model,
               usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
               finish_reason: "stop", tool_calls: [], sampling: sampling_of(opts) })

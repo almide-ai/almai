@@ -1,6 +1,5 @@
 // Tests of the package root, almai (src/mod.almd).
 
-import json
 import self as almai
 
 
@@ -95,7 +94,7 @@ test "parse_content_as_json" {
     usage: almai.Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     finish_reason: "stop", tool_calls: [], sampling: almai.Sampling { } }
   match almai.parse_content_as_json(r) {
-    ok(v) => assert_eq(value.get_int(v, "x") |> option.unwrap_or(0), 1)
+    ok(v) => assert_eq(value.get_int(v, "x") ?? 0, 1)
     err(_) => assert(false)
   }
 }

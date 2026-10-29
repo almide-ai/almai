@@ -82,7 +82,7 @@ fn message_to_json(m: Message) -> Value = {
 fn messages_to_json(msgs: List[Message]) -> Value =
   value.array(list.map(msgs, (m) => message_to_json(m)))
 
-fn es(v: Value, key: String) -> String = value.get_string(v, key) |> option.unwrap_or("")
+fn es(v: Value, key: String) -> String = value.get_string(v, key) ?? ""
 
 effect fn require_env(key: String) -> Result[String, String] =
   match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
@@ -105,7 +105,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
     ok(api_key) => {
       let user_msgs = list.filter(msgs, (m) => m.role != "system")
       let sys = if opts.system != "" then opts.system
-        else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+        else list.find(msgs, (m) => m.role == "system")?.content ?? ""
       let fields = [("model", value.string(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
       let fields = if sys != "" then fields + [("system", value.string(sys))] else fields
       let fields = if not list.is_empty(opts.tools) then
@@ -116,16 +116,16 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       match post_json("https://api.anthropic.com/v1/messages", body, ["x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"]) {
         err(e) => err("anthropic: " + e)
         ok(parsed) => {
-          let blocks = value.get_array(parsed, "content") |> option.unwrap_or([])
+          let blocks = value.get_array(parsed, "content") ?? []
           let text = blocks |> list.filter_map((b) => if es(b, "type") == "text" then value.get_string(b, "text") else none) |> list.join("")
           let tc = blocks |> list.filter_map((b) =>
             if es(b, "type") == "tool_use" then some(ToolCall { id: es(b, "id"), name: es(b, "name"),
-              arguments: value.get(b, "input") |> option.map((v) => json.stringify(v)) |> option.unwrap_or("{}") }) else none)
+              arguments: option.map(value.get(b, "input"), (v) => json.stringify(v)) ?? "{}" }) else none)
           ok(LLMResponse { content: string.trim(text), model: es(parsed, "model"),
-            usage: { let u = value.get(parsed, "usage") |> option.unwrap_or(value.null())
-              Usage { prompt_tokens: value.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
-                completion_tokens: value.get_int(u, "completion_tokens") |> option.unwrap_or(0),
-                total_tokens: value.get_int(u, "total_tokens") |> option.unwrap_or(0) } },
+            usage: { let u = value.get(parsed, "usage") ?? value.null()
+              Usage { prompt_tokens: value.get_int(u, "prompt_tokens") ?? 0,
+                completion_tokens: value.get_int(u, "completion_tokens") ?? 0,
+                total_tokens: value.get_int(u, "total_tokens") ?? 0 } },
             finish_reason: es(parsed, "stop_reason"), tool_calls: tc, sampling: sampling_of(opts) })
         }
       }
@@ -137,7 +137,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
 fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> Value = {
   let user_msgs = list.filter(msgs, (m) => m.role != "system")
   let sys = if opts.system != "" then opts.system
-    else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+    else list.find(msgs, (m) => m.role == "system")?.content ?? ""
   let fields = [("model", value.string(model)), ("max_tokens", value.int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
   let fields = if sys != "" then fields + [("system", value.string(sys))] else fields
   let fields = if not list.is_empty(opts.tools) then
@@ -163,23 +163,23 @@ effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, 
         ok(raw) => match json.parse(raw) {
           err(e) => err("anthropic streaming: parse aggregate: " + e)
           ok(parsed) => {
-            let tool_calls_arr = value.get_array(parsed, "tool_calls") |> option.unwrap_or([])
+            let tool_calls_arr = value.get_array(parsed, "tool_calls") ?? []
             let tool_calls = tool_calls_arr |> list.filter_map((tc) => {
-              let id = value.get_string(tc, "id") |> option.unwrap_or("")
-              let name = value.get_string(tc, "name") |> option.unwrap_or("")
-              let args = value.get_string(tc, "arguments") |> option.unwrap_or("{}")
+              let id = value.get_string(tc, "id") ?? ""
+              let name = value.get_string(tc, "name") ?? ""
+              let args = value.get_string(tc, "arguments") ?? "{}"
               if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
             })
-            let usage_obj = value.get(parsed, "usage") |> option.unwrap_or(value.null())
+            let usage_obj = value.get(parsed, "usage") ?? value.null()
             ok(LLMResponse {
-              content: value.get_string(parsed, "content") |> option.unwrap_or(""),
-              model: value.get_string(parsed, "model") |> option.unwrap_or(""),
+              content: value.get_string(parsed, "content") ?? "",
+              model: value.get_string(parsed, "model") ?? "",
               usage: Usage {
-                prompt_tokens: value.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
-                completion_tokens: value.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
-                total_tokens: value.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
+                prompt_tokens: value.get_int(usage_obj, "prompt_tokens") ?? 0,
+                completion_tokens: value.get_int(usage_obj, "completion_tokens") ?? 0,
+                total_tokens: value.get_int(usage_obj, "total_tokens") ?? 0,
               },
-              finish_reason: value.get_string(parsed, "finish_reason") |> option.unwrap_or("end_turn"),
+              finish_reason: value.get_string(parsed, "finish_reason") ?? "end_turn",
               tool_calls: tool_calls,
               sampling: sampling_of(opts),
             })

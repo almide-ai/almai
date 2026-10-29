@@ -51,11 +51,10 @@ fn nothing_sent() -> Sampling = Sampling { }
 
 fn resolve_system(msgs: List[Message], opts: CallOptions) -> String =
   if opts.system != "" then opts.system
-  else list.find(msgs, (m) => m.role == "system")
-    |> option.map((m) => m.content) |> option.unwrap_or("")
+  else list.find(msgs, (m) => m.role == "system")?.content ?? ""
 
 fn last_user(msgs: List[Message]) -> String =
-  list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+  list.last(msgs)?.content ?? ""
 
 // Render a multi-turn conversation as a single stuffed-prompt block.
 // Each message becomes a labelled section; the trailing user message
@@ -64,7 +63,7 @@ fn render_history(msgs: List[Message]) -> String = {
   let user_msgs = list.filter(msgs, (m) => m.role != "system")
   match list.len(user_msgs) {
     0 => ""
-    1 => list.first(user_msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+    1 => list.first(user_msgs)?.content ?? ""
     _ => {
       let label = (m: Message) => match m.role {
         "user" => "User"
@@ -111,11 +110,11 @@ fn parse_claude_json(raw: String) -> LLMResponse = {
       finish_reason: "", tool_calls: [], sampling: nothing_sent(),
     }
     ok(v) => {
-      let result_text = value.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
-      let usage_obj = value.get(v, "usage") |> option.unwrap_or(value.null())
-      let in_tok  = value.get_int(usage_obj, "input_tokens")  |> option.unwrap_or(0)
-      let out_tok = value.get_int(usage_obj, "output_tokens") |> option.unwrap_or(0)
-      let model = value.get_string(v, "session_id") |> option.unwrap_or("claude-cli")
+      let result_text = value.get_string(v, "result") ?? string.trim(raw)
+      let usage_obj = value.get(v, "usage") ?? value.null()
+      let in_tok  = value.get_int(usage_obj, "input_tokens") ?? 0
+      let out_tok = value.get_int(usage_obj, "output_tokens") ?? 0
+      let model = value.get_string(v, "session_id") ?? "claude-cli"
       LLMResponse {
         content: string.trim(result_text), model: model,
         usage: Usage { prompt_tokens: in_tok, completion_tokens: out_tok, total_tokens: in_tok + out_tok },

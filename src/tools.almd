@@ -67,13 +67,12 @@ fn tools_to_json(ts: List[Tool]) -> Value =
 // ── Parsing ──
 
 fn parse_tool_calls(v: Value) -> List[ToolCall] =
-  value.get_array(v, "tool_calls")
-    |> option.unwrap_or([])
+  value.get_array(v, "tool_calls") ?? []
     |> list.filter_map((tc) => {
-      let id = value.get_string(tc, "id") |> option.unwrap_or("")
-      let func = value.get(tc, "function") |> option.unwrap_or(value.null())
-      let name = value.get_string(func, "name") |> option.unwrap_or("")
-      let args = value.get_string(func, "arguments") |> option.unwrap_or("{}")
+      let id = value.get_string(tc, "id") ?? ""
+      let func = value.get(tc, "function") ?? value.null()
+      let name = value.get_string(func, "name") ?? ""
+      let args = value.get_string(func, "arguments") ?? "{}"
       if name != "" then some(ToolCall { id: id, name: name, arguments: args })
       else none
     })
@@ -124,7 +123,7 @@ test "parse_tool_calls extracts from JSON" {
   ])
   let calls = parse_tool_calls(raw)
   assert_eq(list.len(calls), 1)
-  let first = list.get(calls, 0) |> option.unwrap_or(ToolCall { id: "", name: "", arguments: "" })
+  let first = list.get(calls, 0) ?? ToolCall { id: "", name: "", arguments: "" }
   assert_eq(first.name, "greet")
   assert_eq(first.id, "call_1")
 }
@@ -133,7 +132,7 @@ test "parse_tool_call_args parses JSON" {
   let tc = ToolCall { id: "1", name: "f", arguments: "{\"x\":42}" }
   let parsed = parse_tool_call_args(tc)
   match parsed {
-    ok(v) => assert_eq(value.get_int(v, "x") |> option.unwrap_or(0), 42)
+    ok(v) => assert_eq(value.get_int(v, "x") ?? 0, 42)
     err(_) => assert(false)
   }
 }

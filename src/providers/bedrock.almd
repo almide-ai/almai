@@ -42,7 +42,7 @@ effect fn require_env(key: String) -> Result[String, String] =
 effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
   let _ = require_env("AWS_ACCESS_KEY_ID") |> result.map_err((e) => "bedrock: " + e)!
   let _ = require_env("AWS_SECRET_ACCESS_KEY") |> result.map_err((e) => "bedrock: " + e)!
-  let region = env.get("AWS_REGION") |> option.unwrap_or("us-east-1")
+  let region = env.get("AWS_REGION") ?? "us-east-1"
   let url = "https://bedrock-runtime." + region + ".amazonaws.com/model/" + model + "/converse"
   // Note: Full SigV4 signing requires HMAC-SHA256 which Almide stdlib doesn't yet support.
   // For now, this provider works when called through an AWS SDK proxy or when
@@ -50,7 +50,7 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
   // TODO: Implement SigV4 signing when bytes.hmac_sha256 is available.
   let headers: Map[String, String] = [
     "Content-Type": "application/json",
-    "X-Amz-Security-Token": env.get("AWS_SESSION_TOKEN") |> option.unwrap_or(""),
+    "X-Amz-Security-Token": env.get("AWS_SESSION_TOKEN") ?? "",
   ]
   let raw = http.request("POST", url, json.stringify(body_of(msgs, opts)), map.to_list(headers)) |> result.map_err((e) => "bedrock: http: " + e)!
   let parsed = json.parse(raw) |> result.map_err((e) => "bedrock: json: " + e)!
@@ -62,27 +62,26 @@ fn body_of(msgs: List[Message], opts: CallOptions) -> Value = {
   let messages = value.array(list.map(list.filter(msgs, (m) => m.role != "system"),
     (m) => value.object([("role", value.string(m.role)), ("content", value.array([value.object([("text", value.string(m.content))])]))])))
   let sys = if opts.system != "" then opts.system
-    else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+    else list.find(msgs, (m) => m.role == "system")?.content ?? ""
   let fields = [("messages", messages), ("inferenceConfig", value.object([("maxTokens", value.int(opts.max_tokens))]))]
   value.object(if sys != "" then fields + [("system", value.array([value.object([("text", value.string(sys))])]))] else fields)
 }
 
 fn response_of(parsed: Value, model: String, opts: CallOptions) -> LLMResponse = {
-  let content = value.get(parsed, "output")
+  let content = (value.get(parsed, "output")
     |> option.flat_map((o) => value.get(o, "message"))
     |> option.flat_map((m) => value.get_array(m, "content"))
     |> option.flat_map((cs) => list.first(cs))
-    |> option.flat_map((c) => value.get_string(c, "text"))
-    |> option.unwrap_or("")
-  let u = value.get(parsed, "usage") |> option.unwrap_or(value.null())
+    |> option.flat_map((c) => value.get_string(c, "text"))) ?? ""
+  let u = value.get(parsed, "usage") ?? value.null()
   LLMResponse {
     content: string.trim(content), model: model,
     usage: Usage {
-      prompt_tokens: value.get_int(u, "inputTokens") |> option.unwrap_or(0),
-      completion_tokens: value.get_int(u, "outputTokens") |> option.unwrap_or(0),
-      total_tokens: value.get_int(u, "totalTokens") |> option.unwrap_or(0),
+      prompt_tokens: value.get_int(u, "inputTokens") ?? 0,
+      completion_tokens: value.get_int(u, "outputTokens") ?? 0,
+      total_tokens: value.get_int(u, "totalTokens") ?? 0,
     },
-    finish_reason: value.get_string(parsed, "stopReason") |> option.unwrap_or("end_turn"),
+    finish_reason: value.get_string(parsed, "stopReason") ?? "end_turn",
     tool_calls: [],
     sampling: sampling_of(opts),
   }

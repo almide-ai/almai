@@ -42,12 +42,12 @@ fn tools_to_json(ts: List[Tool]) -> Value =
       ("name", value.string(t.name)), ("description", value.string(t.description)), ("parameters", t.parameters)]))])))
 
 fn parse_tool_calls(msg: Value) -> List[ToolCall] =
-  value.get_array(msg, "tool_calls") |> option.unwrap_or([])
+  value.get_array(msg, "tool_calls") ?? []
     |> list.filter_map((tc) => {
-      let func = value.get(tc, "function") |> option.unwrap_or(value.null())
-      let name = value.get_string(func, "name") |> option.unwrap_or("")
-      if name != "" then some(ToolCall { id: value.get_string(tc, "id") |> option.unwrap_or(""),
-        name: name, arguments: value.get_string(func, "arguments") |> option.unwrap_or("{}") }) else none
+      let func = value.get(tc, "function") ?? value.null()
+      let name = value.get_string(func, "name") ?? ""
+      if name != "" then some(ToolCall { id: value.get_string(tc, "id") ?? "",
+        name: name, arguments: value.get_string(func, "arguments") ?? "{}" }) else none
     })
 
 effect fn require_env(key: String) -> Result[String, String] =
@@ -67,13 +67,13 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
 }
 
 fn response_of(parsed: Value, model: String, opts: CallOptions) -> LLMResponse = {
-  let choice = value.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(value.null())
-  let msg = value.get(choice, "message") |> option.unwrap_or(value.null())
-  let u = value.get(parsed, "usage") |> option.unwrap_or(value.null())
-  LLMResponse { content: string.trim(value.get_string(msg, "content") |> option.unwrap_or("")),
-    model: model, usage: Usage { prompt_tokens: value.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
-      completion_tokens: value.get_int(u, "completion_tokens") |> option.unwrap_or(0),
-      total_tokens: value.get_int(u, "total_tokens") |> option.unwrap_or(0) },
-    finish_reason: value.get_string(choice, "finish_reason") |> option.unwrap_or("stop"),
+  let choice = option.flat_map(value.get_array(parsed, "choices"), (cs) => list.first(cs)) ?? value.null()
+  let msg = value.get(choice, "message") ?? value.null()
+  let u = value.get(parsed, "usage") ?? value.null()
+  LLMResponse { content: string.trim(value.get_string(msg, "content") ?? ""),
+    model: model, usage: Usage { prompt_tokens: value.get_int(u, "prompt_tokens") ?? 0,
+      completion_tokens: value.get_int(u, "completion_tokens") ?? 0,
+      total_tokens: value.get_int(u, "total_tokens") ?? 0 },
+    finish_reason: value.get_string(choice, "finish_reason") ?? "stop",
     tool_calls: parse_tool_calls(msg), sampling: sampling_of(opts) }
 }

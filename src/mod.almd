@@ -13,7 +13,6 @@
 // Submodules: almai.tools, almai.conv, almai.providers.*
 
 import env
-import int
 import json
 import self.providers.openai as openai_provider
 import self.providers.anthropic as anthropic_provider
@@ -139,7 +138,7 @@ fn with_seed(opts: CallOptions, n: Int) -> CallOptions = { ...opts, seed: n }
 // ── Provider parsing ──
 
 fn parse_provider(model_spec: String) -> (String, String) = {
-  let idx = string.index_of(model_spec, "/") |> option.unwrap_or(-1)
+  let idx = string.index_of(model_spec, "/") ?? -1
   if idx < 0 then ("openai", model_spec)
   else (string.take(model_spec, idx), string.drop(model_spec, idx + 1))
 }
