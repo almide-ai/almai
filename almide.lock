@@ -1,3 +1,3 @@
 # almide.lock — auto-generated, do not edit
 
-llm = { git = "https://github.com/almide/llm", ref = "v0.1.0", commit = "e829f78eddb5360f3e0ce5cafa66597be77d3f83" }
+llm = { git = "https://github.com/almide/llm", ref = "v0.2.0", commit = "ab954ce867f3940224a49ac081d343ba401b4846" }

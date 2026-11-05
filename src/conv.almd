@@ -55,10 +55,7 @@ fn last_content(conv: Conversation) -> Option[String] =
   list.last(conv.messages) |> option.map((m) => m.content)
 
 fn system_prompt(conv: Conversation) -> String =
-  conv.messages
-    |> list.find((m) => m.role == "system")
-    |> option.map((m) => m.content)
-    |> option.unwrap_or("")
+  list.find(conv.messages, (m) => m.role == "system")?.content ?? ""
 
 fn user_messages(conv: Conversation) -> List[Message] =
   list.filter(conv.messages, (m) => m.role == "user")

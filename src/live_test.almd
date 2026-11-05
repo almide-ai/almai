@@ -11,7 +11,7 @@ import self.answer as answer
 
 
 test "each endpoint's format gets the request, and its answer is read back the same way" {
-  let req = live.Request { model: "m", messages: [value.object([("role", value.str("system")), ("content", value.str("sys"))])], max_tokens: 100 }
+  let req = live.Request { model: "m", messages: [value.object([("role", value.string("system")), ("content", value.string("sys"))])], max_tokens: 100 }
   let ep = (kind: String, p: String) => route.Endpoint { kind: kind, provider: p, url: "", headers: [], model_id: "m" }
   assert(string.contains(live.encode(ep("chat", "cf"), req).body, "\"max_completion_tokens\":100"))
   assert(string.contains(live.encode(ep("anthropic", "anthropic"), req).body, "\"system\":\"sys\""))
@@ -70,13 +70,13 @@ test "cancel stops the work the request spawned, not only its shell" {
   let sink = fs.create_temp_file("almai-test-sink")!
   let pid_file = fs.create_temp_file("almai-test-pid")!
   let script = "( while true; do echo x >> " + live.sh_quote(sink) + "; sleep 0.05; done ) & c=$!; echo $c > " + live.sh_quote(pid_file) + "; wait $c"
-  let shell_pid = process.spawn("sh", ["-c", script])!
+  let shell = process.start(process.ProcessCommand { cmd: "sh", args: ["-c", script] })!
   env.sleep_ms(400)
   assert(string.len(fs.read_text(sink) ?? "") > 0)
   // `sink` is not one of the paths live.cancel removes: the child would recreate it on the
   // next append, which would hide the very thing measured.
   let scratch = fs.create_temp_file("almai-test-scratch")!
-  live.cancel(live.Pending { id: 1, call: none, sh_pid: shell_pid, pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
+  live.cancel(live.Pending { id: 1, call: none, sh: some(shell), pid_file: pid_file, stream: scratch, cfg: scratch, body: scratch, out: scratch, err: scratch,
     t0: 0, model: "", kind: "chat", session: "", sent: 0, limits: live.limits(), tools: false, schema_tool: false, warnings: [] })!
   env.sleep_ms(400)
   let just_after = string.len(fs.read_text(sink) ?? "")

@@ -37,9 +37,9 @@ fn system(messages: List[Value], tools: List[Value]) -> String = {
   let first = list.first(messages) ?? value.object([])
   let given = if str_of(first, "role") == "system" then str_of(first, "content") else ""
   if list.is_empty(tools) then (if given == "" then "Answer the request exactly as asked." else given)
-  else given + "\n" + PROTOCOL + "\nActions:\n" + string.join(list.map(tools, (t) => {
-    let f = value.field(t, "function") ?? value.object([])
-    "- " + str_of(f, "name") + ": " + str_of(f, "description") + "\n  parameters: " + json.stringify(value.field(f, "parameters") ?? value.object([]))
+  else given + "\n" + PROTOCOL + "\nActions:\n" + list.join(list.map(tools, (t) => {
+    let f = value.get(t, "function") ?? value.object([])
+    "- " + str_of(f, "name") + ": " + str_of(f, "description") + "\n  parameters: " + json.stringify(value.get(f, "parameters") ?? value.object([]))
   }), "\n")
 }
 
@@ -51,7 +51,7 @@ fn prompt(messages: List[Value], from: Int, fresh: Bool) -> String = {
   let users = list.filter(rest, (m) => str_of(m, "role") != "system")
   let only = list.first(users) ?? value.object([])
   if fresh and list.len(users) == 1 and str_of(only, "role") == "user" then str_of(only, "content")
-  else string.join(list.filter_map(rest, (m) => line_of(m, messages, fresh)), "\n\n")
+  else list.join(list.filter_map(rest, (m) => line_of(m, messages, fresh)), "\n\n")
 }
 
 // One message as a paragraph of the prompt, or none for what claude need not see again:
@@ -61,22 +61,22 @@ fn line_of(m: Value, messages: List[Value], fresh: Bool) -> String? = {
   if role == "user" then some((if fresh then "User: " else "") + str_of(m, "content"))
   else if role == "tool" then some("Result of " + wire.call_name(messages, str_of(m, "tool_call_id")) + ":\n" + str_of(m, "content"))
   else if role == "assistant" and fresh then {
-    let calls = list.map(json.get_array(m, "tool_calls") ?? [], (c) => {
-      let f = value.field(c, "function") ?? value.object([])
+    let calls = list.map(value.get_array(m, "tool_calls") ?? [], (c) => {
+      let f = value.get(c, "function") ?? value.object([])
       str_of(f, "name") + " " + str_of(f, "arguments")
     })
-    some("You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + string.join(calls, "; ")))
+    some("You said: " + str_of(m, "content") + (if list.is_empty(calls) then "" else "\nYou called: " + list.join(calls, "; ")))
   }
   else none
 }
 
 fn session_of(text: String) -> Session? = match json.parse(text) {
-  ok(v) => if str_of(v, "id") == "" then none else some(Session { id: str_of(v, "id"), sent: json.get_int(v, "sent") ?? 0, model: str_of(v, "model") }),
+  ok(v) => if str_of(v, "id") == "" then none else some(Session { id: str_of(v, "id"), sent: value.get_int(v, "sent") ?? 0, model: str_of(v, "model") }),
   err(_) => none,
 }
 
 fn session_text(s: Session) -> String =
-  json.stringify(value.object([("id", value.str(s.id)), ("sent", value.int(s.sent)), ("model", value.str(s.model))]))
+  json.stringify(value.object([("id", value.string(s.id)), ("sent", value.int(s.sent)), ("model", value.string(s.model))]))
 
 fn continuing(s: Session?, message_count: Int, model: String) -> Session? = match s {
   some(x) => if x.model == model and x.sent <= message_count and x.sent > 0 then some(x) else none,
@@ -112,13 +112,13 @@ fn exit_failure(code: Int, out: String, said: String) -> core.LlmError =
 // answered in words after all.
 fn answer_of(r: Value, tools: Bool) -> (String, List[wire.ToolCall]) = {
   let text = str_of(r, "result")
-  match value.field(r, "structured_output") {
-    ok(so) => (json.stringify(so), []),
-    err(_) => if not tools then (text, [])
+  match value.get(r, "structured_output") {
+    some(so) => (json.stringify(so), []),
+    none => if not tools then (text, [])
       else match object_in(text) {
-        some(v) => if option.is_some(json.get_array(v, "tool_calls")) or option.is_some(json.get_string(v, "content")) then
-            (str_of(v, "content"), list.map(json.get_array(v, "tool_calls") ?? [], (c) =>
-              wire.ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.field(c, "arguments") ?? value.object([])) }))
+        some(v) => if option.is_some(value.get_array(v, "tool_calls")) or option.is_some(value.get_string(v, "content")) then
+            (str_of(v, "content"), list.map(value.get_array(v, "tool_calls") ?? [], (c) =>
+              wire.ToolCall { id: "", name: str_of(c, "name"), arguments: json.stringify(value.get(c, "arguments") ?? value.object([])) }))
           else (text, []),
         none => (text, []),
       },
@@ -131,11 +131,11 @@ fn read(out: String, code: Int, said: String, tools: Bool) -> Result[(wire.Folde
   match json.parse(string.trim(out)) {
     err(_) => err(exit_failure(code, out, said)),
     // claude reports an API failure as text in `result` ("API Error: 529 ..."), read the same way.
-    ok(r) => if json.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
+    ok(r) => if value.get_bool(r, "is_error") ?? false then err(core.classify(0, "claude: " + str_of(r, "result") + " " + str_of(r, "subtype"), 0))
       else {
         let (content, calls) = answer_of(r, tools)
         ok((wire.Folded { content: content, reasoning: "", calls: calls, finish: str_of(r, "stop_reason"),
-          usage: wire_anthropic.usage_of(wire.field_of(some(r), "usage")), meter: json.get_float(r, "total_cost_usd") ?? -1.0 }, str_of(r, "session_id")))
+          usage: wire_anthropic.usage_of(wire.field_of(some(r), "usage")), meter: value.get_float(r, "total_cost_usd") ?? -1.0 }, str_of(r, "session_id")))
       },
   }
 
@@ -147,13 +147,13 @@ fn warnings(ask: wire.Ask) -> List[String] =
 fn str_of(v: Value, key: String) -> String = wire.str_of(v, key)
 
 test "claude gets the conversation once, then only what is new" {
-  let call = value.object([("id", value.str("c1")), ("type", value.str("function")),
-    ("function", value.object([("name", value.str("read")), ("arguments", value.str("{\"path\":\"a.py\"}"))]))])
+  let call = value.object([("id", value.string("c1")), ("type", value.string("function")),
+    ("function", value.object([("name", value.string("read")), ("arguments", value.string("{\"path\":\"a.py\"}"))]))])
   let ms = [
-    value.object([("role", value.str("system")), ("content", value.str("sys"))]),
-    value.object([("role", value.str("user")), ("content", value.str("fix a.py"))]),
-    value.object([("role", value.str("assistant")), ("content", value.str("")), ("tool_calls", value.array([call]))]),
-    value.object([("role", value.str("tool")), ("tool_call_id", value.str("c1")), ("content", value.str("1 x = 1"))]),
+    value.object([("role", value.string("system")), ("content", value.string("sys"))]),
+    value.object([("role", value.string("user")), ("content", value.string("fix a.py"))]),
+    value.object([("role", value.string("assistant")), ("content", value.string("")), ("tool_calls", value.array([call]))]),
+    value.object([("role", value.string("tool")), ("tool_call_id", value.string("c1")), ("content", value.string("1 x = 1"))]),
   ]
   assert_eq(prompt(ms, 3, false), "Result of read:\n1 x = 1")
   assert(string.starts_with(prompt(ms, 0, true), "User: fix a.py\n\nYou said: \nYou called: read"))
@@ -165,8 +165,8 @@ test "claude gets the conversation once, then only what is new" {
 }
 
 test "claude's answer: the JSON in its text with tools, structured_output with a schema, plain words otherwise" {
-  let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.str("s1")),
-    ("result", value.str(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
+  let wrap = (result_text: String) => json.stringify(value.object([("is_error", value.bool(false)), ("session_id", value.string("s1")),
+    ("result", value.string(result_text)), ("usage", value.object([("input_tokens", value.int(2)), ("cache_creation_input_tokens", value.int(1000)), ("output_tokens", value.int(40))]))]))
   match read(wrap("```json\n{\"content\":\"\",\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"path\":\"a.py\"}}]}\n```"), 0, "", true) {
     ok((r, sid)) => { assert_eq(r.calls, [wire.ToolCall { id: "", name: "read", arguments: "{\"path\":\"a.py\"}" }]); assert_eq(sid, "s1"); assert_eq((r.usage.input, r.usage.cache_write), (some(2), some(1000))); assert_eq(core.settled_finish(r.finish, not list.is_empty(r.calls)), core.FinishToolCalls) },
     err(e) => assert_eq(core.error_text(e), ""),
